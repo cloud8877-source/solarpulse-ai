@@ -1,0 +1,23 @@
+{
+  "name": "solarops",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "SolarPulse AI (SolarOps) — AI copilot for solar asset performance & grid intelligence (MAIC Nexus T1 Clean Energy).",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "papaparse": "^5.5.4",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "@types/papaparse": "^5.5.2",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}

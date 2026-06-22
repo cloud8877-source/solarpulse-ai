@@ -1,0 +1,97 @@
+tools:
+  lookup_solar_site:
+    type: read
+    input:
+      site_id: string
+    output:
+      site_id: string
+      name: string
+      region: string
+      capacity_kwp: number
+      latest_status: string
+      is_fixture: boolean
+
+  forecast_solar_yield:
+    type: analysis
+    input:
+      site_id: string
+      horizon: enum(day_ahead, week_ahead, custom)
+      run_at: datetime
+    output:
+      site_id: string
+      horizon: string
+      expected_kwh: number
+      lower_kwh: number
+      upper_kwh: number
+      model_version: string
+      metric:
+        name: string
+        value: number
+      assumptions: list
+      quality_flags: list
+
+  lookup_grid_demand:
+    type: read
+    input:
+      region: string
+      horizon: enum(current, day_ahead, week_ahead)
+    output:
+      region: string
+      horizon: string
+      snapshots: list
+      source: string
+      quality_flags: list
+
+  detect_asset_underperformance:
+    type: analysis
+    input:
+      site_id: string
+      window_start: datetime
+      window_end: datetime
+    output:
+      site_id: string
+      observed_kwh: number
+      expected_kwh: number
+      residual_kwh: number
+      residual_pct: number
+      severity: enum(healthy, watch, anomaly, critical, data_issue)
+      quality_flags: list
+      evidence: object
+
+  explain_solar_anomaly:
+    type: analysis
+    input:
+      anomaly_event_id: string
+    output:
+      likely_cause: enum(weather_explained, inverter_or_string_underperformance, soiling_or_degradation, telemetry_data_quality_issue, possible_curtailment_or_grid_issue, unknown_operator_review_required)
+      confidence: enum(low, medium, high)
+      evidence: list
+      caveats: list
+
+  rank_om_actions:
+    type: analysis
+    input:
+      anomaly_event_id: string
+    output:
+      recommendations:
+        - rank: number
+          action: string
+          expected_recovery_kwh_month: number
+          estimated_rm_value: number
+          estimated_co2_kg: number
+          confidence: enum(low, medium, high)
+          assumptions: object
+
+  generate_solar_report:
+    type: write_lite
+    gated: true
+    input:
+      site_id: string
+      anomaly_event_id: string
+      format: enum(markdown, pdf)
+    output:
+      report_id: string
+      format: string
+      url_or_path: string
+      includes_provenance: boolean
+      includes_assumptions: boolean

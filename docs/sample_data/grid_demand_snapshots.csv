@@ -1,0 +1,5 @@
+id,region,timestamp,demand_mw,forecast_horizon,source,fetched_at,source_url,quality_flags_json
+grid_pm_8,peninsular_malaysia,2026-06-22T08:00:00+08:00,17300,day_ahead,demo_fixture_based_on_single_buyer_context,2026-06-21T20:00:00+08:00,https://www.singlebuyer.com.my/market/market-data/demand,"[""fixture_data"", ""public_context_reference""]"
+grid_pm_12,peninsular_malaysia,2026-06-22T12:00:00+08:00,18200,day_ahead,demo_fixture_based_on_single_buyer_context,2026-06-21T20:00:00+08:00,https://www.singlebuyer.com.my/market/market-data/demand,"[""fixture_data"", ""public_context_reference""]"
+grid_pm_16,peninsular_malaysia,2026-06-22T16:00:00+08:00,18200,day_ahead,demo_fixture_based_on_single_buyer_context,2026-06-21T20:00:00+08:00,https://www.singlebuyer.com.my/market/market-data/demand,"[""fixture_data"", ""public_context_reference""]"
+grid_pm_20,peninsular_malaysia,2026-06-22T20:00:00+08:00,17300,day_ahead,demo_fixture_based_on_single_buyer_context,2026-06-21T20:00:00+08:00,https://www.singlebuyer.com.my/market/market-data/demand,"[""fixture_data"", ""public_context_reference""]"
