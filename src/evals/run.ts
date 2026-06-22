@@ -2,6 +2,7 @@
 // Loads .env.local / .env so the live DeepSeek agent runs when a key is present.
 
 import { existsSync } from "node:fs";
+import { resolveModel } from "../agent/solaropsAgent";
 import { CE_CASES } from "./cases";
 import { runAll } from "./harness";
 
@@ -18,7 +19,7 @@ for (const file of [".env.local", ".env"]) {
 const hasKey = Boolean(process.env.DEEPSEEK_API_KEY);
 const replay = process.env.SOLAROPS_REPLAY === "1";
 const live = hasKey && !replay;
-const model = process.env.SOLAROPS_MODEL ?? "deepseek/deepseek-chat";
+const model = resolveModel();
 
 console.log(
   `SolarOps CE eval pack — mode: ${live ? `LIVE (${model})` : "OFFLINE (deterministic)"}` +

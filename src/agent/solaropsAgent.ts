@@ -1,12 +1,19 @@
 // SolarPulse copilot agent (Mastra + DeepSeek). Lazily constructed so importing this
 // module (e.g. for offline tests) needs no API key — only generate() requires one.
-// Model is overridable via SOLAROPS_MODEL (e.g. deepseek/deepseek-reasoner) if the
-// chat model struggles with the multi-step tool chain.
+// Model is overridable via SOLAROPS_MODEL. Default deepseek-v4-flash (fast + economical);
+// step up to deepseek/deepseek-v4-pro if flash struggles with the multi-step tool chain.
+// (deepseek-chat / deepseek-reasoner retire 2026-07-24 — the V4 family is the path forward.)
 
 import { Agent } from "@mastra/core/agent";
 import { solaropsTools } from "../tools";
 
-export const SOLAROPS_MODEL = process.env.SOLAROPS_MODEL ?? "deepseek/deepseek-chat";
+export const SOLAROPS_DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+
+/** Resolve the model at call time (not import time) so a SOLAROPS_MODEL override loaded
+ *  late from .env.local still applies. */
+export function resolveModel(): string {
+  return process.env.SOLAROPS_MODEL ?? SOLAROPS_DEFAULT_MODEL;
+}
 
 // COST: DeepSeek context caching is automatic and prefix-based — a request only hits the
 // cache when it FULLY matches a cached prefix. These instructions + the tool schemas form a
@@ -65,7 +72,7 @@ export function solaropsAgent(): Agent {
       id: "solarops-copilot",
       name: "SolarPulse Copilot",
       instructions: SOLAROPS_INSTRUCTIONS,
-      model: SOLAROPS_MODEL,
+      model: resolveModel(),
       tools: solaropsTools,
     });
   }
