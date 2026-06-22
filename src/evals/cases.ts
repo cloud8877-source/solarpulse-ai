@@ -8,6 +8,8 @@ import type { CECase } from "./harness";
 const toolNames = (r: CopilotResult): string[] => r.toolTrace.map((t) => t.tool);
 const usedAll = (r: CopilotResult, ...tools: string[]): boolean =>
   tools.every((t) => toolNames(r).includes(t));
+const toolOutput = (r: CopilotResult, tool: string): unknown =>
+  r.toolTrace.find((t) => t.tool === tool)?.output;
 
 function check(asserts: [boolean, string][]): { pass: boolean; reasons: string[] } {
   const reasons = asserts.filter(([ok]) => !ok).map(([, msg]) => msg);
@@ -70,13 +72,21 @@ export const CE_CASES: CECase[] = [
     id: "CE5",
     title: "Report provenance",
     prompt: "Generate a report for the owner of Site B.",
-    check: (r) =>
-      check([
+    // Validate the actual report artifact (the generate_solar_report tool output), not
+    // the model's prose summary — the live agent paraphrases, but the report itself
+    // carries the source provenance, assumptions, and fixture label.
+    check: (r) => {
+      const report = toolOutput(r, "generate_solar_report") as
+        | { content?: string; includes_provenance?: boolean; includes_assumptions?: boolean }
+        | undefined;
+      const content = typeof report?.content === "string" ? report.content : "";
+      return check([
         [r.safety.ok, "answer failed numeric grounding / safety"],
-        [/provenance/i.test(r.answer), "report missing source provenance"],
-        [/assumption/i.test(r.answer), "report missing assumptions"],
-        [/fixture_data/i.test(r.answer), "report does not label fixture data"],
-        [usedAll(r, "generate_solar_report"), "missing report tool call"],
-      ]),
+        [Boolean(report), "missing report tool call"],
+        [report?.includes_provenance === true && /provenance/i.test(content), "report missing source provenance"],
+        [report?.includes_assumptions === true && /assumption/i.test(content), "report missing assumptions"],
+        [/fixture_data/i.test(content), "report does not label fixture data"],
+      ]);
+    },
   },
 ];

@@ -8,6 +8,12 @@ import { solaropsTools } from "../tools";
 
 export const SOLAROPS_MODEL = process.env.SOLAROPS_MODEL ?? "deepseek/deepseek-chat";
 
+// COST: DeepSeek context caching is automatic and prefix-based — a request only hits the
+// cache when it FULLY matches a cached prefix. These instructions + the tool schemas form a
+// long, STABLE prefix sent on every call, while the variable user question goes last, so
+// repeat calls reuse the cached prefix (~10x cheaper on hits). Keep this string static and
+// never inject per-request/variable content here, or cache hits break.
+// Ref: https://api-docs.deepseek.com/guides/kv_cache
 export const SOLAROPS_INSTRUCTIONS = `You are SolarPulse, an AI copilot for solar asset performance and grid intelligence.
 
 CORE RULE — you never compute or invent numbers. Every kWh, MWh, RM, %, kg CO2, severity,

@@ -162,6 +162,24 @@ function liveToolTrace(result: unknown): ToolTraceEntry[] {
   return trace;
 }
 
+// Surface DeepSeek context-cache usage so prefix-cache savings are observable
+// (cached input tokens are billed ~10x cheaper). Best-effort across field shapes.
+function logUsage(result: unknown): void {
+  const r = result as {
+    usage?: Record<string, number>;
+    providerMetadata?: Record<string, Record<string, unknown>>;
+  };
+  const u = r.usage;
+  if (!u) return;
+  const cached =
+    u.cachedInputTokens ??
+    (r.providerMetadata?.deepseek?.promptCacheHitTokens as number | undefined) ??
+    0;
+  console.log(
+    `[solarops] copilot tokens — input ${u.inputTokens ?? 0} (cached ${cached}), output ${u.outputTokens ?? 0}`,
+  );
+}
+
 export interface AskOptions {
   mode?: "auto" | "live" | "offline";
   maxSteps?: number;
@@ -177,6 +195,7 @@ export async function askCopilot(question: string, opts: AskOptions = {}): Promi
 
   try {
     const result = await solaropsAgent().generate(question, { maxSteps: opts.maxSteps ?? 10 });
+    logUsage(result);
     const trace = liveToolTrace(result);
     return enforceGrounding(question, (result as { text?: string }).text ?? "", trace, svc);
   } catch (err) {

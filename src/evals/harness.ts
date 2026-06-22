@@ -21,13 +21,25 @@ export interface CEOutcome {
   title: string;
   pass: boolean;
   mode: string;
+  adjusted: boolean;
+  toolCount: number;
+  error?: string;
   reasons: string[];
 }
 
 export async function runCase(c: CECase, mode?: "auto" | "live" | "offline"): Promise<CEOutcome> {
   const res = await askCopilot(c.prompt, mode ? { mode } : {});
   const { pass, reasons } = c.check(res);
-  return { id: c.id, title: c.title, pass, mode: res.mode, reasons };
+  return {
+    id: c.id,
+    title: c.title,
+    pass,
+    mode: res.mode,
+    adjusted: res.adjusted,
+    toolCount: res.toolTrace.length,
+    ...(res.error ? { error: res.error } : {}),
+    reasons,
+  };
 }
 
 export async function runAll(cases: CECase[], mode?: "auto" | "live" | "offline"): Promise<CEOutcome[]> {
