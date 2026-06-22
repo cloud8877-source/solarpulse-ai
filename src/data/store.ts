@@ -1,7 +1,14 @@
 // In-memory data store seeded from the fixtures, behind a SQLite-ready interface.
 // A future SqliteStore (better-sqlite3) can implement SolarStore without changing callers.
 
-import type { GridSnapshot, Observation, Report, Site, Weather } from "../domain/types";
+import type {
+  AnomalyEvent,
+  GridSnapshot,
+  Observation,
+  Report,
+  Site,
+  Weather,
+} from "../domain/types";
 import { loadGridSnapshots, loadObservations, loadSites, loadWeather } from "./loader";
 
 export interface SolarStore {
@@ -10,6 +17,9 @@ export interface SolarStore {
   getObservations(siteId: string): Observation[];
   getWeather(siteId: string): Weather[];
   getGridSnapshots(region: string): GridSnapshot[];
+  saveAnomalyEvent(event: AnomalyEvent): void;
+  getAnomalyEvent(id: string): AnomalyEvent | undefined;
+  listAnomalyEvents(siteId?: string): AnomalyEvent[];
   saveReport(report: Report): void;
   getReport(id: string): Report | undefined;
   listReports(siteId?: string): Report[];
@@ -30,6 +40,7 @@ export class InMemoryStore implements SolarStore {
   private readonly obsBySite = new Map<string, Observation[]>();
   private readonly wxBySite = new Map<string, Weather[]>();
   private readonly grid: GridSnapshot[];
+  private readonly anomalyEvents = new Map<string, AnomalyEvent>();
   private readonly reports = new Map<string, Report>();
 
   constructor(seed: StoreSeed = {}) {
@@ -68,6 +79,19 @@ export class InMemoryStore implements SolarStore {
 
   getGridSnapshots(region: string): GridSnapshot[] {
     return this.grid.filter((g) => g.region === region).sort(byTimestamp);
+  }
+
+  saveAnomalyEvent(event: AnomalyEvent): void {
+    this.anomalyEvents.set(event.id, event);
+  }
+
+  getAnomalyEvent(id: string): AnomalyEvent | undefined {
+    return this.anomalyEvents.get(id);
+  }
+
+  listAnomalyEvents(siteId?: string): AnomalyEvent[] {
+    const all = [...this.anomalyEvents.values()];
+    return siteId ? all.filter((e) => e.siteId === siteId) : all;
   }
 
   saveReport(report: Report): void {

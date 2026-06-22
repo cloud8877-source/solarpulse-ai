@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@mastra/core": "^1.45.0",
     "papaparse": "^5.5.4",
     "zod": "^4.4.3"
   },

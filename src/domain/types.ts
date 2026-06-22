@@ -177,6 +177,28 @@ export interface RootCauseResult {
   caveats: string[];
 }
 
+// Persisted anomaly event (schema.sql anomaly_events) = detection + classification,
+// addressable by a deterministic id so explain/rank/report can resolve it later.
+export interface AnomalyEvent {
+  id: string;
+  siteId: string;
+  windowStart: string;
+  windowEnd: string;
+  observedKwh: number;
+  expectedKwh: number;
+  residualKwh: number;
+  residualPct: number;
+  severity: Severity;
+  qualityFlags: QualityFlag[];
+  evidence: AnomalyEvidence;
+  likelyCause: LikelyCause;
+  confidence: Confidence;
+  rootCauseEvidence: string[];
+  caveats: string[];
+  modelVersion: string;
+  createdAt: string;
+}
+
 export interface Recommendation {
   rank: number;
   action: string;
