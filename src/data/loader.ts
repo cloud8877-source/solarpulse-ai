@@ -3,8 +3,7 @@
 // Critical: missing generation_kwh is preserved as null and must NEVER be coerced to 0.
 
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import Papa from "papaparse";
 import type {
   GridSnapshot,
@@ -14,7 +13,9 @@ import type {
   Weather,
 } from "../domain/types";
 
-const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
+// Resolve from the project root: works under vitest and `next dev`/`next start`.
+// (import.meta.url would point into the bundle under Next/Turbopack.)
+const FIXTURE_DIR = join(process.cwd(), "src", "data", "fixtures");
 
 function readCsv(file: string): Record<string, string>[] {
   const text = readFileSync(join(FIXTURE_DIR, file), "utf8");

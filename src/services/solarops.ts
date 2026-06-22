@@ -3,10 +3,12 @@
 // persists anomaly events under deterministic ids, and raises typed errors
 // (PDR-005 §6). No LLM is involved in any calculation here (ADR-0005).
 
+import { assumptions } from "../config/assumptions";
 import { buildSourceManifest, FIXTURE_INPUTS } from "../data/sourceManifest";
 import { getStore, type SolarStore } from "../data/store";
 import { detectUnderperformance } from "../engine/anomaly";
 import { expectedProfile, fixtureWape, forecastSolarYield } from "../engine/forecast";
+import { round } from "../engine/math";
 import { rankActions } from "../engine/recommend";
 import { classifyRootCause } from "../engine/rootCause";
 import { generateReport } from "../engine/report";
@@ -289,8 +291,62 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     return store.listSites().map((s) => lookupSolarSite(s.id));
   }
 
+  // Portfolio rollup for the dashboard overview (PDR-006 §2, Screen 1).
+  function portfolioSummary() {
+    const rows = store.listSites().map((s) => {
+      const detect = detectAssetUnderperformance(s.id);
+      const topAction =
+        detect.severity === "healthy"
+          ? null
+          : (rankOmActions(detect.anomaly_event_id).recommendations[0] ?? null);
+      return { summary: lookupSolarSite(s.id), detect, topAction };
+    });
+    const isShortfall = (sev: string) => sev === "watch" || sev === "anomaly" || sev === "critical";
+    const sum = (f: (r: (typeof rows)[number]) => number) => rows.reduce((a, r) => a + f(r), 0);
+    const kpi = {
+      total_capacity_kwp: sum((r) => r.summary.capacity_kwp),
+      expected_kwh: round(sum((r) => r.detect.expected_kwh)),
+      observed_kwh: round(sum((r) => r.detect.observed_kwh)),
+      lost_kwh: round(sum((r) => (isShortfall(r.detect.severity) ? Math.abs(r.detect.residual_kwh) : 0))),
+      active_anomalies: rows.filter((r) => r.detect.severity === "anomaly" || r.detect.severity === "critical").length,
+      rm_at_risk: round(sum((r) => r.topAction?.estimated_rm_value ?? 0)),
+      co2_at_risk: round(sum((r) => r.topAction?.estimated_co2_kg ?? 0)),
+    };
+    return { rows, kpi };
+  }
+
+  // Everything the Site Detail screen needs, including the hourly observed-vs-expected
+  // series for the forecast chart.
+  function siteDetail(siteId: string) {
+    const site = requireSite(siteId);
+    const weather = store.getWeather(siteId);
+    const expByTs = new Map(expectedProfile(site, weather).map((i) => [i.timestamp, i.expectedKwh]));
+    const band = assumptions.confidenceBandPct;
+    const series = store.getObservations(siteId).map((o) => {
+      const expected = round(expByTs.get(o.timestamp) ?? 0);
+      return {
+        time: o.timestamp.slice(11, 16),
+        observed: o.generationKwh,
+        expected,
+        lower: round(expected * (1 - band)),
+        upper: round(expected * (1 + band)),
+      };
+    });
+    const detect = detectAssetUnderperformance(siteId);
+    return {
+      site: lookupSolarSite(siteId),
+      forecast: forecast(siteId, "day_ahead"),
+      detect,
+      explanation: explainSolarAnomaly(detect.anomaly_event_id),
+      recommendations: rankOmActions(detect.anomaly_event_id).recommendations,
+      series,
+    };
+  }
+
   return {
     listSites,
+    portfolioSummary,
+    siteDetail,
     lookupSolarSite,
     forecast,
     lookupGridDemand,
