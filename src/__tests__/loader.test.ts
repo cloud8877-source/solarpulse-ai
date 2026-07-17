@@ -1,8 +1,25 @@
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { FIXTURE_CSV } from "../data/fixtures.gen";
 import { loadGridSnapshots, loadObservations, loadSites, loadWeather } from "../data/loader";
 import { InMemoryStore } from "../data/store";
 
 describe("fixture loader (P1 data spine)", () => {
+  it("embeds every CSV fixture present on disk", () => {
+    const fixturesDir = join(process.cwd(), "src", "data", "fixtures");
+    const csvFiles = readdirSync(fixturesDir).filter((name) => name.endsWith(".csv"));
+    expect(csvFiles.length).toBeGreaterThan(0);
+    for (const file of csvFiles) {
+      expect(FIXTURE_CSV).toHaveProperty(file);
+      // Exact content match: catches an edited CSV whose re-embed was forgotten,
+      // not just a missing key. Regenerate with `npm run embed:fixtures`.
+      expect(FIXTURE_CSV[file]).toBe(readFileSync(join(fixturesDir, file), "utf8"));
+    }
+    // No orphaned embeds for deleted CSVs either.
+    expect(Object.keys(FIXTURE_CSV).sort()).toEqual(csvFiles.sort());
+  });
+
   it("loads exactly 3 labeled sites with expected capacities", () => {
     const sites = loadSites();
     expect(sites.map((s) => s.id).sort()).toEqual(["site_a", "site_b", "site_c"]);
