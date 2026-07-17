@@ -12,7 +12,9 @@
     "eval": "tsx src/evals/run.ts",
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "cf:build": "opennextjs-cloudflare build",
+    "cf:preview": "opennextjs-cloudflare preview"
   },
   "dependencies": {
     "@ai-sdk/amazon-bedrock": "5.0.23",
