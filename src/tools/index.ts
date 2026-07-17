@@ -1,8 +1,8 @@
-// SolarOps Mastra tools (PDR-005 / tool_contracts.yaml). Thin, zod-validated wrappers
+// SolarOps AI SDK tools (PDR-005 / tool_contracts.yaml). Thin, zod-validated wrappers
 // over the deterministic service layer. The agent calls these; it must never compute
 // kWh/RM/CO2/% itself — every number here is tool-computed (ADR-0005).
 
-import { createTool } from "@mastra/core/tools";
+import { tool } from "ai";
 import { z } from "zod";
 import { solarOps } from "../services/solarops";
 
@@ -30,8 +30,7 @@ const evidenceSchema = z.object({
   notes: z.array(z.string()),
 });
 
-export const lookupSolarSiteTool = createTool({
-  id: "lookup_solar_site",
+export const lookupSolarSiteTool = tool({
   description:
     "Return solar site metadata and its latest computed health status. Read-only. Use first to resolve a site before forecasting or anomaly analysis.",
   inputSchema: z.object({ site_id: z.string().describe("Site id, e.g. site_a / site_b / site_c") }),
@@ -46,8 +45,7 @@ export const lookupSolarSiteTool = createTool({
   execute: async ({ site_id }) => solarOps().lookupSolarSite(site_id),
 });
 
-export const forecastSolarYieldTool = createTool({
-  id: "forecast_solar_yield",
+export const forecastSolarYieldTool = tool({
   description:
     "Deterministic day-ahead/week-ahead solar generation forecast (expected kWh + confidence band + fixture backtest metric). The model must report these numbers as-is, never invent them.",
   inputSchema: z.object({
@@ -69,8 +67,7 @@ export const forecastSolarYieldTool = createTool({
   execute: async ({ site_id, horizon, run_at }) => solarOps().forecast(site_id, horizon, run_at),
 });
 
-export const lookupGridDemandTool = createTool({
-  id: "lookup_grid_demand",
+export const lookupGridDemandTool = tool({
   description:
     "Return public Single Buyer demand context snapshots for a region. Read-only. If no data is available the snapshots list is empty and the caller must state demand context is unavailable.",
   inputSchema: z.object({
@@ -87,8 +84,7 @@ export const lookupGridDemandTool = createTool({
   execute: async ({ region, horizon }) => solarOps().lookupGridDemand(region, horizon),
 });
 
-export const detectAssetUnderperformanceTool = createTool({
-  id: "detect_asset_underperformance",
+export const detectAssetUnderperformanceTool = tool({
   description:
     "Deterministically compare observed vs expected generation over a window and return residual, severity, evidence, and an anomaly_event_id. Data-quality issues short-circuit to severity=data_issue (do not diagnose equipment on bad telemetry).",
   inputSchema: z.object({
@@ -111,8 +107,7 @@ export const detectAssetUnderperformanceTool = createTool({
     solarOps().detectAssetUnderperformance(site_id, window_start, window_end),
 });
 
-export const explainSolarAnomalyTool = createTool({
-  id: "explain_solar_anomaly",
+export const explainSolarAnomalyTool = tool({
   description:
     "Return the rule-based likely cause, confidence, evidence, and caveats for a persisted anomaly event id (from detect_asset_underperformance).",
   inputSchema: z.object({ anomaly_event_id: z.string() }),
@@ -125,8 +120,7 @@ export const explainSolarAnomalyTool = createTool({
   execute: async ({ anomaly_event_id }) => solarOps().explainSolarAnomaly(anomaly_event_id),
 });
 
-export const rankOmActionsTool = createTool({
-  id: "rank_om_actions",
+export const rankOmActionsTool = tool({
   description:
     "Return O&M actions ranked by likely impact for an anomaly event, each with deterministic expected recovery kWh/month, estimated RM value, estimated CO2, confidence, and the assumptions used. Recommends inspection/review only — never autonomous dispatch.",
   inputSchema: z.object({ anomaly_event_id: z.string() }),
@@ -146,8 +140,7 @@ export const rankOmActionsTool = createTool({
   execute: async ({ anomaly_event_id }) => solarOps().rankOmActions(anomaly_event_id),
 });
 
-export const generateSolarReportTool = createTool({
-  id: "generate_solar_report",
+export const generateSolarReportTool = tool({
   description:
     "Generate an owner/O&M Markdown report for a site + anomaly event. Always includes source provenance and assumptions, labels fixture data, and states field verification is required.",
   inputSchema: z.object({

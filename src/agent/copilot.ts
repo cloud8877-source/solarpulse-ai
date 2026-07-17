@@ -1,18 +1,20 @@
 // Copilot orchestration for POST /api/solarops/ask.
 //  - offline: deterministic pipeline + 7-part renderer (no API key; public demo path).
-//  - live: Mastra+DeepSeek agent orchestrates the tools, then the answer is
+//  - live: AI SDK generateText + DeepSeek orchestrates the tools, then the answer is
 //    safety-enforced — if it fails numeric grounding or hits the denylist, it is
 //    replaced by the tool-grounded deterministic answer. The FINAL answer is always
 //    grounded, which is what makes CE4 hold regardless of model behavior.
 
+import { generateText, stepCountIs, type LanguageModelUsage } from "ai";
 import { createSolarOpsService, type SolarOpsService } from "../services/solarops";
+import { solaropsTools } from "../tools";
 import {
   renderPortfolioForecastAnswer,
   renderSiteTriageAnswer,
   type SiteTriage,
 } from "./answer";
 import { validateAnswer, type SafetyResult } from "./safety";
-import { solaropsAgent } from "./solaropsAgent";
+import { hasLiveCredentials, resolveModel, SOLAROPS_INSTRUCTIONS } from "./solaropsAgent";
 
 export interface ToolTraceEntry {
   tool: string;
@@ -143,37 +145,32 @@ export function enforceGrounding(
   };
 }
 
-function liveToolTrace(result: unknown): ToolTraceEntry[] {
-  const r = result as {
-    toolCalls?: { payload?: { toolCallId?: string; toolName?: string; args?: unknown } }[];
-    toolResults?: { payload?: { toolCallId?: string; toolName?: string; result?: unknown } }[];
-  };
-  const calls = new Map<string, { tool?: string; input?: unknown }>();
-  for (const tc of r.toolCalls ?? []) {
-    const p = tc.payload ?? {};
-    if (p.toolCallId) calls.set(p.toolCallId, { tool: p.toolName, input: p.args });
-  }
+// AI SDK v7 GenerateTextResult: toolResults is a flat array of { toolName, input, output }.
+function liveToolTrace(result: {
+  toolResults?: Array<{ toolName?: string; input?: unknown; output?: unknown }>;
+}): ToolTraceEntry[] {
   const trace: ToolTraceEntry[] = [];
-  for (const tr of r.toolResults ?? []) {
-    const p = tr.payload ?? {};
-    const call = (p.toolCallId && calls.get(p.toolCallId)) || {};
-    trace.push({ tool: p.toolName ?? call.tool ?? "tool", input: call.input ?? null, output: p.result ?? null });
+  for (const tr of result.toolResults ?? []) {
+    trace.push({
+      tool: tr.toolName ?? "tool",
+      input: tr.input ?? null,
+      output: tr.output ?? null,
+    });
   }
   return trace;
 }
 
 // Surface DeepSeek context-cache usage so prefix-cache savings are observable
 // (cached input tokens are billed ~10x cheaper). Best-effort across field shapes.
-function logUsage(result: unknown): void {
-  const r = result as {
-    usage?: Record<string, number>;
-    providerMetadata?: Record<string, Record<string, unknown>>;
-  };
-  const u = r.usage;
+function logUsage(result: {
+  usage?: LanguageModelUsage;
+  providerMetadata?: Record<string, Record<string, unknown>>;
+}): void {
+  const u = result.usage;
   if (!u) return;
   const cached =
-    u.cachedInputTokens ??
-    (r.providerMetadata?.deepseek?.promptCacheHitTokens as number | undefined) ??
+    u.inputTokenDetails?.cacheReadTokens ??
+    (result.providerMetadata?.deepseek?.promptCacheHitTokens as number | undefined) ??
     0;
   console.log(
     `[solarops] copilot tokens — input ${u.inputTokens ?? 0} (cached ${cached}), output ${u.outputTokens ?? 0}`,
@@ -187,17 +184,23 @@ export interface AskOptions {
 
 export async function askCopilot(question: string, opts: AskOptions = {}): Promise<CopilotResult> {
   const replay = process.env.SOLAROPS_REPLAY === "1";
-  const hasKey = Boolean(process.env.DEEPSEEK_API_KEY);
-  const mode = opts.mode ?? (hasKey && !replay ? "live" : "offline");
+  const mode = opts.mode ?? (hasLiveCredentials() && !replay ? "live" : "offline");
   const svc = createSolarOpsService();
 
   if (mode === "offline") return buildOfflineResult(question, svc);
 
   try {
-    const result = await solaropsAgent().generate(question, { maxSteps: opts.maxSteps ?? 10 });
+    // Default stopWhen is stepCountIs(1); multi-tool chains need a higher budget.
+    const result = await generateText({
+      model: resolveModel(),
+      system: SOLAROPS_INSTRUCTIONS,
+      prompt: question,
+      tools: solaropsTools,
+      stopWhen: stepCountIs(opts.maxSteps ?? 10),
+    });
     logUsage(result);
     const trace = liveToolTrace(result);
-    return enforceGrounding(question, (result as { text?: string }).text ?? "", trace, svc);
+    return enforceGrounding(question, result.text ?? "", trace, svc);
   } catch (err) {
     // Live path FAILED (bad key / provider/router error / network). Do NOT label this
     // "live" — that would make a broken live path look identical to a working one.

@@ -1,8 +1,8 @@
 // CE eval CLI: `npm run eval`. Runs CE1–CE5 and exits non-zero on any failure.
-// Loads .env.local / .env so the live DeepSeek agent runs when a key is present.
+// Loads .env.local / .env so the live agent runs when provider credentials are present.
 
 import { existsSync } from "node:fs";
-import { resolveModel } from "../agent/solaropsAgent";
+import { hasLiveCredentials, resolveModelId } from "../agent/solaropsAgent";
 import { CE_CASES } from "./cases";
 import { runAll } from "./harness";
 
@@ -16,14 +16,19 @@ for (const file of [".env.local", ".env"]) {
   }
 }
 
-const hasKey = Boolean(process.env.DEEPSEEK_API_KEY);
+const model = resolveModelId();
+const provider = model.includes("/") ? model.slice(0, model.indexOf("/")) : model;
+const liveCreds = hasLiveCredentials();
 const replay = process.env.SOLAROPS_REPLAY === "1";
-const live = hasKey && !replay;
-const model = resolveModel();
+const live = liveCreds && !replay;
 
 console.log(
   `SolarOps CE eval pack — mode: ${live ? `LIVE (${model})` : "OFFLINE (deterministic)"}` +
-    (live ? "" : "  [set DEEPSEEK_API_KEY for live agent runs]"),
+    (live
+      ? `  [creds: ${provider} ok]`
+      : liveCreds
+        ? "  [SOLAROPS_REPLAY=1 forces offline]"
+        : `  [no live credentials for ${model}; set DEEPSEEK_API_KEY or AWS_ACCESS_KEY_ID+AWS_SECRET_ACCESS_KEY / AWS_BEARER_TOKEN_BEDROCK]`),
 );
 console.log("");
 
@@ -46,7 +51,7 @@ console.log(`\n${results.length - failed}/${results.length} passed.`);
 if (live && fellBack > 0) {
   console.log(
     `\n⚠  ${fellBack}/${results.length} case(s) did NOT run on the live agent (fell back to the` +
-      ` deterministic path — check DEEPSEEK_API_KEY / model / network). Those passes do NOT` +
+      ` deterministic path — check ${provider} credentials / model / network). Those passes do NOT` +
       ` validate the AI; investigate before claiming the ADR-0007 gate is met.`,
   );
 }

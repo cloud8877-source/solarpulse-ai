@@ -1,4 +1,4 @@
-// SolarOps service layer — the single implementation behind both the Mastra tools
+// SolarOps service layer — the single implementation behind both the AI SDK tools
 // (agent) and the REST routes (dashboard). Wires engine + store + source manifest,
 // persists anomaly events under deterministic ids, and raises typed errors
 // (PDR-005 §6). No LLM is involved in any calculation here (ADR-0005).

@@ -1,25 +1,82 @@
-// SolarPulse copilot agent (Mastra + DeepSeek). Lazily constructed so importing this
-// module (e.g. for offline tests) needs no API key — only generate() requires one.
-// Model is overridable via SOLAROPS_MODEL. Default deepseek-v4-flash (fast + economical);
-// step up to deepseek/deepseek-v4-pro if flash struggles with the multi-step tool chain.
+// SolarPulse copilot model resolution (Vercel AI SDK + DeepSeek / Bedrock).
+// Lazily constructed at call time so importing this module (e.g. for offline tests)
+// needs no API key — only generateText requires one.
+// Model is overridable via SOLAROPS_MODEL as "provider/model-id".
+// Default deepseek/deepseek-v4-flash (fast + economical); step up to
+// deepseek/deepseek-v4-pro if flash struggles with the multi-step tool chain.
 // (deepseek-chat / deepseek-reasoner retire 2026-07-24 — the V4 family is the path forward.)
 
-import { Agent } from "@mastra/core/agent";
-import { solaropsTools } from "../tools";
+import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
+import { createDeepSeek } from "@ai-sdk/deepseek";
+import type { LanguageModel } from "ai";
 
 export const SOLAROPS_DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 
-/** Resolve the model at call time (not import time) so a SOLAROPS_MODEL override loaded
- *  late from .env.local still applies. */
-export function resolveModel(): string {
+/** Resolved model id string (provider/model-id) for logging/display. */
+export function resolveModelId(): string {
   return process.env.SOLAROPS_MODEL ?? SOLAROPS_DEFAULT_MODEL;
+}
+
+/** Parse "provider/model-id" once so resolveModel / hasLiveCredentials stay in sync. */
+function parseModelSpec(spec: string): { provider: string; modelId: string } {
+  const slash = spec.indexOf("/");
+  if (slash <= 0 || slash === spec.length - 1) {
+    throw new Error(
+      `SOLAROPS_MODEL must be "provider/model-id" (got ${JSON.stringify(spec)})`,
+    );
+  }
+  return { provider: spec.slice(0, slash), modelId: spec.slice(slash + 1) };
+}
+
+/**
+ * Whether env has credentials for the provider in SOLAROPS_MODEL.
+ * deepseek → DEEPSEEK_API_KEY; bedrock → SigV4 (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY)
+ * or bearer token (AWS_BEARER_TOKEN_BEDROCK) per @ai-sdk/amazon-bedrock settings.
+ */
+export function hasLiveCredentials(): boolean {
+  const { provider } = parseModelSpec(resolveModelId());
+  if (provider === "deepseek") {
+    return Boolean(process.env.DEEPSEEK_API_KEY);
+  }
+  if (provider === "bedrock") {
+    // Matches AmazonBedrockProviderSettings: apiKey defaults to AWS_BEARER_TOKEN_BEDROCK;
+    // otherwise SigV4 via accessKeyId/secretAccessKey env defaults.
+    const sigv4 = Boolean(
+      process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY,
+    );
+    const bearer = Boolean(process.env.AWS_BEARER_TOKEN_BEDROCK);
+    return sigv4 || bearer;
+  }
+  return false;
+}
+
+/** Resolve a LanguageModel instance at call time (not import time) so a SOLAROPS_MODEL
+ *  override loaded late from .env.local still applies. */
+export function resolveModel(): LanguageModel {
+  const { provider, modelId } = parseModelSpec(resolveModelId());
+
+  if (provider === "deepseek") {
+    // DEEPSEEK_API_KEY is read from env by the provider when apiKey is omitted;
+    // pass explicitly so a late-loaded key still applies at construction time.
+    return createDeepSeek({ apiKey: process.env.DEEPSEEK_API_KEY })(modelId);
+  }
+  if (provider === "bedrock") {
+    // Region/credentials default to AWS_REGION / AWS_ACCESS_KEY_ID /
+    // AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN (or AWS_BEARER_TOKEN_BEDROCK).
+    return createAmazonBedrock()(modelId);
+  }
+  throw new Error(
+    `Unsupported SOLAROPS_MODEL provider "${provider}" (supported: deepseek, bedrock)`,
+  );
 }
 
 // COST: DeepSeek context caching is automatic and prefix-based — a request only hits the
 // cache when it FULLY matches a cached prefix. These instructions + the tool schemas form a
-// long, STABLE prefix sent on every call, while the variable user question goes last, so
-// repeat calls reuse the cached prefix (~10x cheaper on hits). Keep this string static and
-// never inject per-request/variable content here, or cache hits break.
+// long, STABLE prefix sent on every call (via generateText system + tools), while the
+// variable user question goes last, so repeat calls reuse the cached prefix (~10x cheaper
+// on hits). Keep this string static and never inject per-request/variable content here, or
+// cache hits break. The AI SDK surfaces cache hits as usage.inputTokenDetails.cacheReadTokens
+// and providerMetadata.deepseek.promptCacheHitTokens.
 // Ref: https://api-docs.deepseek.com/guides/kv_cache
 export const SOLAROPS_INSTRUCTIONS = `You are SolarPulse, an AI copilot for solar asset performance and grid intelligence.
 
@@ -62,19 +119,3 @@ SAFETY (hard constraints):
 
 ERRORS — if a tool fails or the site is unknown, say the analysis could not be completed
 and ask for a valid site; do not guess.`;
-
-let cached: Agent | null = null;
-
-/** Lazily construct the agent (no API call at construction; generate() needs the key). */
-export function solaropsAgent(): Agent {
-  if (!cached) {
-    cached = new Agent({
-      id: "solarops-copilot",
-      name: "SolarPulse Copilot",
-      instructions: SOLAROPS_INSTRUCTIONS,
-      model: resolveModel(),
-      tools: solaropsTools,
-    });
-  }
-  return cached;
-}
