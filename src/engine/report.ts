@@ -14,7 +14,7 @@ import type {
   SourceManifest,
 } from "../domain/types";
 
-function renderManifest(m: SourceManifest): string {
+export function renderManifest(m: SourceManifest): string {
   const inputs = m.inputs
     .map((i) => {
       const url = i.url ? ` — ${i.url}` : "";
