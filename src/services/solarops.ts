@@ -11,6 +11,7 @@ import { expectedProfile, fixtureWape, forecastSolarYield } from "../engine/fore
 import { round } from "../engine/math";
 import { rankActions } from "../engine/recommend";
 import { classifyRootCause } from "../engine/rootCause";
+import { generateGreenReport } from "../engine/greenReport";
 import { generateReport } from "../engine/report";
 import type {
   AnomalyEvent,
@@ -287,6 +288,45 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     };
   }
 
+  // Client-facing Green Performance Report (monthly O&M pack). Formats the same
+  // deterministic detect + root-cause numbers used elsewhere — no LLM.
+  function generateGreenPerformanceReport(siteId: string, now?: string) {
+    const site = requireSite(siteId);
+    if (store.getObservations(siteId).length === 0) {
+      throw new SolarOpsError("no_observations", `No telemetry available for site '${siteId}'.`);
+    }
+    const ev = detectEvent(siteId);
+    const anomaly = eventToAnomalyResult(ev);
+    const rootCause = eventToRootCause(ev);
+    const reportId = `gpr_${siteId}_${ymd(ev.windowStart)}`;
+    const manifest = buildSourceManifest({
+      runId: reportId,
+      inputs: [
+        FIXTURE_INPUTS.solar_sites!,
+        FIXTURE_INPUTS.solar_observations!,
+        FIXTURE_INPUTS.weather_observations!,
+      ],
+      ...(now ? { now } : {}),
+    });
+    const report = generateGreenReport({
+      site,
+      anomaly,
+      rootCause,
+      manifest,
+      reportId,
+      ...(now ? { now } : {}),
+    });
+    store.saveReport(report);
+    return {
+      report_id: report.reportId,
+      format: report.format,
+      url_or_path: `/sites/${siteId}/green-report`,
+      includes_provenance: report.includesProvenance,
+      includes_assumptions: report.includesAssumptions,
+      content: report.content,
+    };
+  }
+
   function listSites() {
     return store.listSites().map((s) => lookupSolarSite(s.id));
   }
@@ -354,6 +394,7 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     explainSolarAnomaly,
     rankOmActions,
     generateSolarReport,
+    generateGreenPerformanceReport,
   };
 }
 
