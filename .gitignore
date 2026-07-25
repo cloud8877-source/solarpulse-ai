@@ -10,3 +10,4 @@ out/
 coverage/
 .claude/settings.local.json
 *.tsbuildinfo
+.wrangler/
