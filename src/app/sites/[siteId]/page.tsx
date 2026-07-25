@@ -33,8 +33,9 @@ export default async function SiteDetail({ params }: { params: Promise<{ siteId:
         <h1 style={{ display: "flex", alignItems: "center", gap: 12 }}>
           {site.name} <StatusBadge status={site.latest_status} />
         </h1>
-        <span className="muted">
+        <span className="muted" style={{ display: "flex", alignItems: "center", gap: 12 }}>
           {site.region} · {fmtInt(site.capacity_kwp)} kWp
+          <Link href={`/sites/${site.site_id}/green-report`}>Green Performance Report →</Link>
         </span>
       </div>
 

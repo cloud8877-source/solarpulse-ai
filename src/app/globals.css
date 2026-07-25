@@ -127,6 +127,34 @@ td.num, th.num { text-align: right; }
 
 .answer { white-space: pre-wrap; line-height: 1.6; }
 .report-md { white-space: pre-wrap; font-family: var(--mono); font-size: 0.82rem; line-height: 1.55; color: var(--text-dim); max-height: 520px; overflow: auto; }
+.report-md.report-print { max-height: none; overflow: visible; color: var(--text); }
+
+@media print {
+  .app-header,
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #fff;
+    color: #111;
+  }
+  .container {
+    max-width: none;
+    padding: 0;
+  }
+  .card {
+    box-shadow: none;
+    border: none;
+    background: #fff;
+    padding: 0;
+  }
+  .report-md,
+  .report-md.report-print {
+    color: #111;
+    max-height: none;
+    overflow: visible;
+  }
+}
 
 .prompt-row { display: flex; gap: 10px; margin-top: 12px; }
 .prompt-row input { flex: 1; padding: 11px 14px; border-radius: var(--radius-sm); background: var(--bg); border: 1px solid var(--border); color: var(--text); font-family: inherit; font-size: 0.92rem; }
