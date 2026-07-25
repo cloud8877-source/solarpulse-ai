@@ -10,24 +10,34 @@ function svc() {
 }
 
 describe("Green Performance Report (GPR)", () => {
-  it("site_a (healthy) includes observed/expected kWh, RM value, CO2 kg, assumptions, fixture label", () => {
+  it("site_a (healthy) asserts literal RM / CO2 / performance index and fixture provenance", () => {
     const rep = svc().generateGreenPerformanceReport("site_a", FIXED_NOW);
 
     expect(rep.includes_provenance).toBe(true);
     expect(rep.includes_assumptions).toBe(true);
     expect(rep.format).toBe("markdown");
     expect(rep.content).toContain("Green Performance Report");
-    expect(rep.content).toMatch(/Observed generation\s*\|\s*\*\*[\d.]+ kWh\*\*/);
-    expect(rep.content).toMatch(/Weather-adjusted expected\s*\|\s*\*\*[\d.]+ kWh\*\*/);
-    expect(rep.content).toMatch(/RM [\d.]+/);
-    expect(rep.content).toMatch(/[\d.]+ kg CO₂e/);
+    expect(rep.content).toContain("| Observed generation | **4659.14 kWh** |");
+    expect(rep.content).toContain("| Weather-adjusted expected | **4651.61 kWh** |");
+    expect(rep.content).toContain(
+      "| Performance index (observed / expected) | **100.2%** |",
+    );
+    // Literal financial / carbon figures (must catch a broken calculation).
+    expect(rep.content).toContain("**RM 2329.57**");
+    expect(rep.content).toContain("**3028.44 kg CO₂e**");
     expect(rep.content).toContain("Assumptions");
     expect(rep.content).toContain("| Name | Value | Note |");
     expect(rep.content).toContain("fixture_data");
     expect(rep.content).toContain("solarops-baseline-v1");
     expect(rep.content).toContain(rep.report_id);
-    // healthy path — no anomaly framing as primary status
     expect(rep.content).toMatch(/\*\*Status:\*\* healthy/);
+    // Structured data mirrors the same numbers for the JSX page.
+    expect(rep.data.production.observedKwh).toBe(4659.14);
+    expect(rep.data.production.expectedKwh).toBe(4651.61);
+    expect(rep.data.production.performanceIndexDisplay).toBe("100.2%");
+    expect(rep.data.value.rmValue).toBe(2329.57);
+    expect(rep.data.value.co2Kg).toBe(3028.44);
+    expect(rep.data.incidents.severity).toBe("healthy");
   });
 
   it("site_b (anomalous) mentions the anomaly and its likely cause", () => {
@@ -37,6 +47,29 @@ describe("Green Performance Report (GPR)", () => {
     expect(rep.content).toContain("inverter or string underperformance");
     expect(rep.content).toContain("fixture_data");
     expect(rep.content).toContain("Assumptions");
+    expect(rep.data.incidents.severity).toBe("anomaly");
+    expect(rep.data.incidents.causePlain).toBe("inverter or string underperformance");
+    expect(rep.data.incidents.evidence.length).toBeGreaterThan(0);
+  });
+
+  it("site_c (data_issue) states interval coverage, evidence lines, and does not present period totals", () => {
+    const rep = svc().generateGreenPerformanceReport("site_c", FIXED_NOW);
+
+    expect(rep.content).toMatch(/\*\*Status:\*\* data_issue/);
+    expect(rep.data.incidents.severity).toBe("data_issue");
+    // Interval coverage caveat next to observed figure (8 of 11 valid intervals).
+    expect(rep.content).toContain("based on 8 of 11 valid intervals");
+    expect(rep.data.production.coverageNote).toBe("based on 8 of 11 valid intervals");
+    // Evidence lines from root cause (symmetric with anomalous branch).
+    expect(rep.content).toContain("Evidence:");
+    expect(rep.data.incidents.evidence.length).toBeGreaterThan(0);
+    for (const line of rep.data.incidents.evidence) {
+      expect(rep.content).toContain(line);
+    }
+    expect(rep.content).toContain(
+      "No equipment fault is confirmed while telemetry quality is insufficient.",
+    );
+    expect(rep.content).toContain("telemetry / data-quality issue");
   });
 
   it("determinism — two runs with the same injected now produce identical content", () => {

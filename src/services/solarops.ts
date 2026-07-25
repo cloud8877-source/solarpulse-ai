@@ -8,11 +8,11 @@ import { buildSourceManifest, FIXTURE_INPUTS } from "../data/sourceManifest";
 import { getStore, type SolarStore } from "../data/store";
 import { detectUnderperformance } from "../engine/anomaly";
 import { expectedProfile, fixtureWape, forecastSolarYield } from "../engine/forecast";
+import { generateGreenReport } from "../engine/greenReport";
 import { round } from "../engine/math";
 import { rankActions } from "../engine/recommend";
-import { classifyRootCause } from "../engine/rootCause";
-import { generateGreenReport } from "../engine/greenReport";
 import { generateReport } from "../engine/report";
+import { classifyRootCause } from "../engine/rootCause";
 import type {
   AnomalyEvent,
   AnomalyResult,
@@ -292,9 +292,7 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
   // deterministic detect + root-cause numbers used elsewhere — no LLM.
   function generateGreenPerformanceReport(siteId: string, now?: string) {
     const site = requireSite(siteId);
-    if (store.getObservations(siteId).length === 0) {
-      throw new SolarOpsError("no_observations", `No telemetry available for site '${siteId}'.`);
-    }
+    // detectEvent also requires the site and throws no_observations when empty.
     const ev = detectEvent(siteId);
     const anomaly = eventToAnomalyResult(ev);
     const rootCause = eventToRootCause(ev);
@@ -308,12 +306,13 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
       ],
       ...(now ? { now } : {}),
     });
-    const report = generateGreenReport({
+    const { report, data } = generateGreenReport({
       site,
       anomaly,
       rootCause,
       manifest,
       reportId,
+      anomalyEventId: ev.id,
       ...(now ? { now } : {}),
     });
     store.saveReport(report);
@@ -324,6 +323,7 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
       includes_provenance: report.includesProvenance,
       includes_assumptions: report.includesAssumptions,
       content: report.content,
+      data,
     };
   }
 
