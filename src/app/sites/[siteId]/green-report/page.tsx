@@ -125,10 +125,29 @@ export default async function GreenReportPage({ params }: { params: Promise<{ si
         )}
 
         <h2 style={{ marginTop: 20 }}>Value &amp; Sustainability</h2>
-        <p style={{ marginBottom: 4 }}>
-          Energy value of observed production: <strong>RM {v.rmValue}</strong> (at RM{" "}
-          {v.tariffRmPerKwh}/kWh tariff assumption).
-        </p>
+        {v.valuationMode === "atap_stack" ? (
+          <>
+            <p style={{ marginBottom: 4 }}>
+              Energy value of observed production: <strong>RM {v.rmValue}</strong>{" "}
+              (avoided cost of self-consumed kWh at full LV volumetric stack RM{" "}
+              {v.volumetricStackRmPerKwh}/kWh + export credit at Average SMP RM{" "}
+              {v.averageSmpRmPerKwh}/kWh).
+            </p>
+            <p style={{ marginBottom: 4 }} className="muted">
+              Avoided cost (self-consumed {v.selfConsumedKwh} kWh × RM {v.volumetricStackRmPerKwh}
+              /kWh): <strong>RM {v.avoidedCostRm}</strong>
+            </p>
+            <p style={{ marginBottom: 4 }} className="muted">
+              Export credit (exported {v.exportedKwh} kWh × RM {v.averageSmpRmPerKwh}/kWh):{" "}
+              <strong>RM {v.exportCreditRm}</strong>
+            </p>
+          </>
+        ) : (
+          <p style={{ marginBottom: 4 }}>
+            Energy value of observed production: <strong>RM {v.rmValue}</strong> (at RM{" "}
+            {v.tariffRmPerKwh}/kWh tariff assumption).
+          </p>
+        )}
         <p>
           CO₂ avoided from observed production: <strong>{v.co2Kg} kg CO₂e</strong> (at{" "}
           {v.carbonFactor} kgCO₂e/kWh carbon factor).
