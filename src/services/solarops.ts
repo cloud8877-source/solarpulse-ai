@@ -18,9 +18,11 @@ import type {
   AnomalyResult,
   GridHorizon,
   Horizon,
+  Observation,
   ReportFormat,
   RootCauseResult,
   Severity,
+  Weather,
 } from "../domain/types";
 
 const REFERENCE_SITE_ID = "site_a"; // healthy reference for the model backtest WAPE
@@ -53,6 +55,29 @@ function siteIdFromEventId(id: string): string {
   return id.replace(/^anom_/, "").replace(/_\d{8}$/, "");
 }
 
+/** Parse YYYY-MM-DD from a day-keyed anomaly id (e.g. anom_site_b_20260621). */
+function dateFromEventId(id: string): string | null {
+  const m = id.match(/_(\d{8})$/);
+  if (!m) return null;
+  const d = m[1]!;
+  return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
+}
+
+function dateKey(timestamp: string): string {
+  return timestamp.slice(0, 10);
+}
+
+function dayWindow(asOfDate: string): { windowStart: string; windowEnd: string } {
+  return {
+    windowStart: `${asOfDate}T00:00:00+08:00`,
+    windowEnd: `${asOfDate}T23:59:59+08:00`,
+  };
+}
+
+function filterByDate<T extends { timestamp: string }>(rows: T[], asOfDate: string): T[] {
+  return rows.filter((r) => dateKey(r.timestamp) === asOfDate);
+}
+
 function eventToAnomalyResult(ev: AnomalyEvent): AnomalyResult {
   return {
     siteId: ev.siteId,
@@ -80,6 +105,27 @@ function eventToRootCause(ev: AnomalyEvent): RootCauseResult {
 
 export function createSolarOpsService(store: SolarStore = getStore()) {
   let referenceWapeCache: number | null | undefined; // undefined = not computed yet
+  let latestFixtureDateCache: string | null | undefined;
+
+  /** Latest ISO date (YYYY-MM-DD) present in fixture observations; demo default asOfDate. */
+  function latestFixtureDate(): string {
+    if (latestFixtureDateCache !== undefined && latestFixtureDateCache !== null) {
+      return latestFixtureDateCache;
+    }
+    let max = "";
+    for (const s of store.listSites()) {
+      for (const o of store.getObservations(s.id)) {
+        const d = dateKey(o.timestamp);
+        if (d > max) max = d;
+      }
+    }
+    latestFixtureDateCache = max || "2026-06-21";
+    return latestFixtureDateCache;
+  }
+
+  function resolveAsOfDate(asOfDate?: string): string {
+    return asOfDate ?? latestFixtureDate();
+  }
 
   function referenceWape(): number | undefined {
     if (referenceWapeCache === undefined) {
@@ -97,18 +143,33 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     return site;
   }
 
-  function detectEvent(siteId: string, windowStart?: string, windowEnd?: string): AnomalyEvent {
+  function detectEvent(
+    siteId: string,
+    windowStart?: string,
+    windowEnd?: string,
+    asOfDate?: string,
+  ): AnomalyEvent {
     const site = requireSite(siteId);
     const observations = store.getObservations(siteId);
     if (observations.length === 0) {
       throw new SolarOpsError("no_observations", `No telemetry available for site '${siteId}'.`);
     }
+
+    // Explicit windows win; otherwise scope to asOfDate (default = latest fixture day).
+    let start = windowStart;
+    let end = windowEnd;
+    if (!start && !end) {
+      const bounds = dayWindow(resolveAsOfDate(asOfDate));
+      start = bounds.windowStart;
+      end = bounds.windowEnd;
+    }
+
     const anomaly = detectUnderperformance({
       site,
       observations,
       weather: store.getWeather(siteId),
-      ...(windowStart ? { windowStart } : {}),
-      ...(windowEnd ? { windowEnd } : {}),
+      ...(start ? { windowStart: start } : {}),
+      ...(end ? { windowEnd: end } : {}),
     });
     const rootCause = classifyRootCause({ anomaly, site });
     const event: AnomalyEvent = {
@@ -141,16 +202,19 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     if (existing) return existing;
     const siteId = siteIdFromEventId(anomalyEventId);
     if (store.getSite(siteId)) {
-      const derived = detectEvent(siteId);
+      const date = dateFromEventId(anomalyEventId);
+      const derived = date ? detectEvent(siteId, undefined, undefined, date) : detectEvent(siteId);
       if (derived.id === anomalyEventId) return derived;
     }
     throw new SolarOpsError("anomaly_not_found", `Unknown anomaly event '${anomalyEventId}'.`);
   }
 
-  function lookupSolarSite(siteId: string) {
+  function lookupSolarSite(siteId: string, asOfDate?: string) {
     const site = requireSite(siteId);
+    const day = resolveAsOfDate(asOfDate);
+    const dayObs = filterByDate(store.getObservations(siteId), day);
     const latestStatus: Severity =
-      store.getObservations(siteId).length > 0 ? detectEvent(siteId).severity : "data_issue";
+      dayObs.length > 0 ? detectEvent(siteId, undefined, undefined, day).severity : "data_issue";
     return {
       site_id: site.id,
       name: site.name,
@@ -161,13 +225,20 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     };
   }
 
-  function forecast(siteId: string, horizon: Horizon = "day_ahead", runAt?: string) {
+  function forecast(siteId: string, horizon: Horizon = "day_ahead", runAt?: string, asOfDate?: string) {
     const site = requireSite(siteId);
-    const observations = store.getObservations(siteId);
-    const resolvedRunAt = runAt ?? observations[observations.length - 1]?.timestamp ?? site.commissioningDate ?? "";
+    const day = resolveAsOfDate(asOfDate);
+    const allObs = store.getObservations(siteId);
+    const allWx = store.getWeather(siteId);
+    // Scope weather + observations to asOfDate so day_ahead stays a single-day profile
+    // (multi-day fixtures must not inflate expected_kwh 4×).
+    const observations: Observation[] = filterByDate(allObs, day);
+    const weather: Weather[] = filterByDate(allWx, day);
+    const resolvedRunAt =
+      runAt ?? observations[observations.length - 1]?.timestamp ?? site.commissioningDate ?? "";
     const f = forecastSolarYield({
       site,
-      weather: store.getWeather(siteId),
+      weather,
       observations,
       horizon,
       runAt: resolvedRunAt,
@@ -201,8 +272,13 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     };
   }
 
-  function detectAssetUnderperformance(siteId: string, windowStart?: string, windowEnd?: string) {
-    const ev = detectEvent(siteId, windowStart, windowEnd);
+  function detectAssetUnderperformance(
+    siteId: string,
+    windowStart?: string,
+    windowEnd?: string,
+    asOfDate?: string,
+  ) {
+    const ev = detectEvent(siteId, windowStart, windowEnd, asOfDate);
     return {
       anomaly_event_id: ev.id,
       site_id: ev.siteId,
@@ -290,10 +366,11 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
 
   // Client-facing Green Performance Report (monthly O&M pack). Formats the same
   // deterministic detect + root-cause numbers used elsewhere — no LLM.
-  function generateGreenPerformanceReport(siteId: string, now?: string) {
+  function generateGreenPerformanceReport(siteId: string, now?: string, asOfDate?: string) {
     const site = requireSite(siteId);
+    const day = resolveAsOfDate(asOfDate);
     // detectEvent also requires the site and throws no_observations when empty.
-    const ev = detectEvent(siteId);
+    const ev = detectEvent(siteId, undefined, undefined, day);
     const anomaly = eventToAnomalyResult(ev);
     const rootCause = eventToRootCause(ev);
     const reportId = `gpr_${siteId}_${ymd(ev.windowStart)}`;
@@ -327,19 +404,20 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     };
   }
 
-  function listSites() {
-    return store.listSites().map((s) => lookupSolarSite(s.id));
+  function listSites(asOfDate?: string) {
+    return store.listSites().map((s) => lookupSolarSite(s.id, asOfDate));
   }
 
   // Portfolio rollup for the dashboard overview (PDR-006 §2, Screen 1).
-  function portfolioSummary() {
+  function portfolioSummary(asOfDate?: string) {
+    const day = resolveAsOfDate(asOfDate);
     const rows = store.listSites().map((s) => {
-      const detect = detectAssetUnderperformance(s.id);
+      const detect = detectAssetUnderperformance(s.id, undefined, undefined, day);
       const topAction =
         detect.severity === "healthy"
           ? null
           : (rankOmActions(detect.anomaly_event_id).recommendations[0] ?? null);
-      return { summary: lookupSolarSite(s.id), detect, topAction };
+      return { summary: lookupSolarSite(s.id, day), detect, topAction };
     });
     const isShortfall = (sev: string) => sev === "watch" || sev === "anomaly" || sev === "critical";
     const sum = (f: (r: (typeof rows)[number]) => number) => rows.reduce((a, r) => a + f(r), 0);
@@ -356,13 +434,14 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
   }
 
   // Everything the Site Detail screen needs, including the hourly observed-vs-expected
-  // series for the forecast chart.
-  function siteDetail(siteId: string) {
+  // series for the forecast chart (scoped to asOfDate).
+  function siteDetail(siteId: string, asOfDate?: string) {
     const site = requireSite(siteId);
-    const weather = store.getWeather(siteId);
+    const day = resolveAsOfDate(asOfDate);
+    const weather = filterByDate(store.getWeather(siteId), day);
     const expByTs = new Map(expectedProfile(site, weather).map((i) => [i.timestamp, i.expectedKwh]));
     const band = assumptions.confidenceBandPct;
-    const series = store.getObservations(siteId).map((o) => {
+    const series = filterByDate(store.getObservations(siteId), day).map((o) => {
       const expected = round(expByTs.get(o.timestamp) ?? 0);
       return {
         time: o.timestamp.slice(11, 16),
@@ -372,10 +451,10 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
         upper: round(expected * (1 + band)),
       };
     });
-    const detect = detectAssetUnderperformance(siteId);
+    const detect = detectAssetUnderperformance(siteId, undefined, undefined, day);
     return {
-      site: lookupSolarSite(siteId),
-      forecast: forecast(siteId, "day_ahead"),
+      site: lookupSolarSite(siteId, day),
+      forecast: forecast(siteId, "day_ahead", undefined, day),
       detect,
       explanation: explainSolarAnomaly(detect.anomaly_event_id),
       recommendations: rankOmActions(detect.anomaly_event_id).recommendations,
@@ -395,6 +474,8 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     rankOmActions,
     generateSolarReport,
     generateGreenPerformanceReport,
+    /** Exposed for tests: resolves default asOfDate from fixture observations. */
+    latestFixtureDate,
   };
 }
 
