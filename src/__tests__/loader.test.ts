@@ -21,7 +21,7 @@ describe("fixture loader (P1 data spine)", () => {
     expect(Object.keys(FIXTURE_CSV).sort()).toEqual(csvFiles.sort());
   });
 
-  it("loads exactly 3 labeled sites with expected capacities", () => {
+  it("loads exactly 3 labeled sites with expected capacities and tariff categories", () => {
     const sites = loadSites();
     expect(sites.map((s) => s.id).sort()).toEqual(["site_a", "site_b", "site_c"]);
     expect(sites.every((s) => s.isFixture)).toBe(true);
@@ -30,6 +30,9 @@ describe("fixture loader (P1 data spine)", () => {
     expect(byId.site_b!.capacityKwp).toBe(2500);
     expect(byId.site_c!.capacityKwp).toBe(950);
     expect(byId.site_a!.performanceRatio).toBeCloseTo(0.78);
+    expect(byId.site_a!.tariffCategory).toBe("lv_general");
+    expect(byId.site_b!.tariffCategory).toBe("mv_general");
+    expect(byId.site_c!.tariffCategory).toBe("lv_general");
   });
 
   it("loads 3 sites × 24 hours × 4 days of solar and weather observations", () => {
