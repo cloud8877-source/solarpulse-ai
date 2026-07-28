@@ -243,10 +243,12 @@ function isAssumptionEntry(obj: Record<string, unknown>): obj is {
 }
 
 function poolEntry(value: number, key: string): PooledNumber {
+  // Rate keys (X_per_Y / XPerY) and any key containing "carbon" (factors only in
+  // this codebase; totals use "co2") match identity — never ×1000 / ×0.001.
   return {
     value: Math.abs(value),
     unitClass: classifyKey(key),
-    identityOnly: isRateKey(key),
+    identityOnly: isRateKey(key) || key.toLowerCase().includes("carbon"),
   };
 }
 

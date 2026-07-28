@@ -201,6 +201,33 @@ describe("safety: unit-aware grounding pool (I2c / KREDIT)", () => {
       expect(res.ungroundedClaims.some((c) => c.canonical === 652 && c.unit === "kwh")).toBe(true);
     });
 
+    // F20/F21: green-report short key carbonFactor=0.652 is mass_co2 but not rate-shaped;
+    // identityOnly (via "carbon" in key) must block ×1000 / near-miss ×1000 probes.
+    // Pool is real generateGreenPerformanceReport('site_a') DTO (where carbonFactor lives).
+    it("does not ground '652 kg' via green-report carbonFactor 0.652 × 1000", () => {
+      const greenOnly = [realPool[4]];
+      // Sanity: live green-report DTO really exposes the short camelCase key.
+      const green = realPool[4] as { data: { value: { carbonFactor: number } } };
+      expect(green.data.value.carbonFactor).toBe(0.652);
+      const res = validateAnswer("Avoided 652 kg CO2.", greenOnly);
+      expect(res.grounded).toBe(false);
+      expect(res.ungroundedClaims.some((c) => c.canonical === 652 && c.unit === "kg")).toBe(true);
+    });
+
+    it("does not ground '648.03 kg' via carbonFactor 0.652 × 1000 (within 2%)", () => {
+      const greenOnly = [realPool[4]];
+      const res = validateAnswer("Avoided 648.03 kg CO₂.", greenOnly);
+      expect(res.grounded).toBe(false);
+      expect(res.ungroundedClaims.some((c) => c.raw.includes("648.03"))).toBe(true);
+    });
+
+    it("does not ground '64.80 kg' via carbonFactor 0.652 × 100", () => {
+      const greenOnly = [realPool[4]];
+      const res = validateAnswer("Avoided 64.80 kg CO₂.", greenOnly);
+      expect(res.grounded).toBe(false);
+      expect(res.ungroundedClaims.some((c) => c.raw.includes("64.80"))).toBe(true);
+    });
+
     it("does not ground '5,000 kWh' via count 5 × 1000", () => {
       const res = validateAnswer("Generation was 5,000 kWh.", realPool);
       expect(res.grounded).toBe(false);
@@ -269,10 +296,22 @@ describe("safety: unit-aware grounding pool (I2c / KREDIT)", () => {
     it("grounds kg claims against estimated_co2_kg, not the carbon factor ×1000", () => {
       const res = validateAnswer("Avoided 14,164.23 kg CO₂.", realPool);
       expect(res.grounded).toBe(true);
+      // Negative property the title claims: factor×1000 must NOT ground (F21).
+      const factorX1000 = validateAnswer("Avoided 652 kg CO2.", realPool);
+      expect(factorX1000.grounded).toBe(false);
+      expect(
+        factorX1000.ungroundedClaims.some((c) => c.canonical === 652 && c.unit === "kg"),
+      ).toBe(true);
     });
 
     it("grounds green-report co2Kg mass claim", () => {
       const res = validateAnswer("Avoided 3037.76 kg CO₂e.", realPool);
+      expect(res.grounded).toBe(true);
+    });
+
+    it("grounds honest carbon factor identity phrasing '0.652 kg' on green-report pool", () => {
+      const greenOnly = [realPool[4]];
+      const res = validateAnswer("Avoided 0.652 kg CO2.", greenOnly);
       expect(res.grounded).toBe(true);
     });
 
