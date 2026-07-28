@@ -1,6 +1,6 @@
 /**
- * KREDIT action ledger tests (I4 / I4b).
- * Covers InMemoryLedger, transition guard, boundary attacks L1–L5,
+ * KREDIT action ledger tests (I4 / I4b / I4c).
+ * Covers InMemoryLedger, transition guard, boundary attacks L1–L6,
  * D1Ledger via FakeD1, getLedger routing, buildDemoSeed, migration drift.
  * No Workers runtime required.
  */
@@ -232,6 +232,16 @@ class FakeD1 implements D1Like {
   }
 }
 
+/** Test ledger with seedAction enabled (explicit opt-in). */
+function memWithSeeding(): InMemoryLedger {
+  return new InMemoryLedger({ allowSeeding: true });
+}
+
+/** Test D1 ledger with seedAction enabled (explicit opt-in). */
+function d1WithSeeding(): D1Ledger {
+  return new D1Ledger(new FakeD1(), { allowSeeding: true });
+}
+
 // ---------------------------------------------------------------------------
 // Domain id helpers
 // ---------------------------------------------------------------------------
@@ -337,7 +347,7 @@ describe("N11 migration ↔ mapping column drift guard", () => {
 
 describe("InMemoryLedger", () => {
   it("CRUD: save, get, list newest-first, filters, sweeps", async () => {
-    const ledger = new InMemoryLedger();
+    const ledger = memWithSeeding();
     const older = baseAction({
       id: actionId("site_a", "2026-06-20", 1),
       createdAt: "2026-06-20T08:00:00+08:00",
@@ -461,7 +471,7 @@ describe("InMemoryLedger", () => {
 
     for (const path of legalPaths) {
       it(`allows ${path.from} -> ${path.to}`, async () => {
-        const ledger = new InMemoryLedger();
+        const ledger = memWithSeeding();
         const a = baseAction({
           status: path.from,
           decidedBy: path.from === "approved" ? "alice" : null,
@@ -495,7 +505,7 @@ describe("InMemoryLedger", () => {
     });
 
     it("rejects awaiting_approval -> issued", async () => {
-      const ledger = new InMemoryLedger();
+      const ledger = memWithSeeding();
       await seedAction(ledger, baseAction({ status: "awaiting_approval" }));
       await expectLedgerError(
         ledger.transitionAction(actionId("site_a", "2026-06-20", 1), "issued", {
@@ -506,7 +516,7 @@ describe("InMemoryLedger", () => {
     });
 
     it("rejects approved WITHOUT decidedBy", async () => {
-      const ledger = new InMemoryLedger();
+      const ledger = memWithSeeding();
       await seedAction(ledger, baseAction({ status: "awaiting_approval" }));
       await expectLedgerError(
         ledger.transitionAction(actionId("site_a", "2026-06-20", 1), "approved"),
@@ -521,14 +531,19 @@ describe("InMemoryLedger", () => {
     });
 
     it("rejects issued -> anything and denied/expired terminals", async () => {
-      const ledger = new InMemoryLedger();
-      for (const terminal of ["issued", "denied_by_policy", "expired"] as const) {
-        const id = actionId("site_a", "2026-06-20", terminal === "issued" ? 1 : 2);
+      const ledger = memWithSeeding();
+      const terminals: Array<{ status: ActionStatus; seq: number }> = [
+        { status: "issued", seq: 1 },
+        { status: "denied_by_policy", seq: 2 },
+        { status: "expired", seq: 3 },
+      ];
+      for (const { status, seq } of terminals) {
+        const id = actionId("site_a", "2026-06-20", seq);
         await seedAction(
           ledger,
           baseAction({
             id,
-            status: terminal,
+            status,
             decidedBy: "alice",
             decidedAt: "2026-06-20T10:00:00+08:00",
           }),
@@ -541,7 +556,7 @@ describe("InMemoryLedger", () => {
     });
 
     it("rejects verification on non-issued; allows falsified on issued", async () => {
-      const ledger = new InMemoryLedger();
+      const ledger = memWithSeeding();
       const proposed = baseAction({ status: "proposed" });
       await ledger.saveAction(proposed);
       const v: ActionVerification = {
@@ -672,7 +687,7 @@ describe("D1Ledger (FakeD1)", () => {
   });
 
   it("listActions filter and newest-first order", async () => {
-    const ledger = new D1Ledger(new FakeD1());
+    const ledger = d1WithSeeding();
     const a1 = baseAction({
       id: actionId("site_a", "2026-06-20", 1),
       siteId: "site_a",
@@ -730,8 +745,9 @@ describe("N14 boundary attacks (L1–L5) on both backends", () => {
     name: string;
     fresh: () => InMemoryLedger | D1Ledger;
   }> = [
-    { name: "InMemoryLedger", fresh: () => new InMemoryLedger() },
-    { name: "D1Ledger", fresh: () => new D1Ledger(new FakeD1()) },
+    // allowSeeding for fixture setup in L2–L4; L1/L5 exercise saveAction only.
+    { name: "InMemoryLedger", fresh: () => memWithSeeding() },
+    { name: "D1Ledger", fresh: () => d1WithSeeding() },
   ];
 
   for (const { name, fresh } of backends) {
@@ -953,6 +969,124 @@ describe("N14 boundary attacks (L1–L5) on both backends", () => {
           }),
           "verification_already_set",
         );
+      });
+    });
+  }
+
+  it("covers both backends", () => {
+    expect(backends.map((x) => x.name)).toEqual(["InMemoryLedger", "D1Ledger"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// L6 — seedAction front door (both backends)
+// ---------------------------------------------------------------------------
+
+describe("L6 seedAction front door (both backends)", () => {
+  const backends: Array<{
+    name: string;
+    /** Default construction: seeding disabled. */
+    sealed: () => InMemoryLedger | D1Ledger;
+    /** Explicit opt-in for historical fixture inserts. */
+    open: () => InMemoryLedger | D1Ledger;
+  }> = [
+    {
+      name: "InMemoryLedger",
+      sealed: () => new InMemoryLedger(),
+      open: () => memWithSeeding(),
+    },
+    {
+      name: "D1Ledger",
+      sealed: () => new D1Ledger(new FakeD1()),
+      open: () => d1WithSeeding(),
+    },
+  ];
+
+  for (const { name, sealed, open } of backends) {
+    describe(name, () => {
+      // L6a: born-issued seed on a sealed instance is refused
+      it("L6: seedAction on allowSeeding:false throws seeding_disabled", async () => {
+        const ledger = sealed();
+        await expectLedgerError(
+          ledger.seedAction(
+            baseAction({
+              id: actionId("site_a", "2026-06-20", 50),
+              status: "issued",
+              decidedBy: "attacker",
+              decidedAt: "2026-06-20T10:00:00+08:00",
+              verification: {
+                outcome: "verified",
+                measuredRm: 999,
+                note: "born issued+graded via seedAction",
+                verifiedAt: "2026-06-20T12:00:00+08:00",
+              },
+            }),
+          ),
+          "seeding_disabled",
+        );
+        expect(await ledger.getAction(actionId("site_a", "2026-06-20", 50))).toBeNull();
+      });
+
+      // L6b: overwrite of an existing graded row is refused even when seeding is open
+      it("L6: seedAction refuses overwrite of existing graded row (already_exists)", async () => {
+        const ledger = open();
+        const id = actionId("site_a", "2026-06-20", 51);
+        await seedAction(
+          ledger,
+          baseAction({
+            id,
+            status: "issued",
+            decidedBy: "alice",
+            decidedAt: "2026-06-20T10:00:00+08:00",
+            verification: {
+              outcome: "verified",
+              measuredRm: 100,
+              note: "delivered verdict",
+              verifiedAt: "2026-06-27T10:00:00+08:00",
+            },
+          }),
+        );
+        await expectLedgerError(
+          ledger.seedAction(
+            baseAction({
+              id,
+              status: "issued",
+              decidedBy: "attacker",
+              decidedAt: "2026-06-28T10:00:00+08:00",
+              verification: {
+                outcome: "falsified",
+                measuredRm: 0,
+                note: "rewrite delivered verdict",
+                verifiedAt: "2026-06-28T12:00:00+08:00",
+              },
+            }),
+          ),
+          "already_exists",
+        );
+        const still = await ledger.getAction(id);
+        expect(still!.verification?.outcome).toBe("verified");
+        expect(still!.verification?.measuredRm).toBe(100);
+        expect(still!.decidedBy).toBe("alice");
+      });
+
+      // Legitimate path: fresh ids on an allowSeeding instance still work
+      it("L6: legitimate seedAction inserts fresh historical fixtures", async () => {
+        const ledger = open();
+        const fixture = baseAction({
+          id: actionId("site_a", "2026-06-20", 52),
+          status: "issued",
+          decidedBy: "seed_operator",
+          decidedAt: "2026-06-20T10:00:00+08:00",
+          verification: {
+            outcome: "falsified",
+            measuredRm: 5,
+            note: "historical fixture",
+            verifiedAt: "2026-06-27T10:00:00+08:00",
+          },
+        });
+        await seedAction(ledger, fixture);
+        const got = await ledger.getAction(fixture.id);
+        expect(got).toEqual(fixture);
       });
     });
   }

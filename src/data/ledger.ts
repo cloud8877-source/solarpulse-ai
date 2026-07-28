@@ -23,7 +23,8 @@ export type LedgerErrorCode =
   | "verification_not_allowed"
   | "verification_already_set"
   | "invalid_initial_status"
-  | "already_exists";
+  | "already_exists"
+  | "seeding_disabled";
 
 export class LedgerError extends Error {
   constructor(
@@ -146,7 +147,11 @@ export interface ActionLedger {
     meta?: TransitionMeta,
   ): Promise<ActionCommitment>;
   setVerification(id: string, v: ActionVerification): Promise<ActionCommitment>;
-  /** Max existing seq for site+day + 1 (starts at 1 when empty). */
+  /**
+   * Max existing seq for site+day + 1 (starts at 1 when empty).
+   * Advisory only — concurrent callers may receive the same value;
+   * saveAction rejects the loser with already_exists; retry with a fresh seq.
+   */
   nextSeq(siteId: string, dateKey: string): Promise<number>;
   saveSweep(s: SweepRun): Promise<void>;
   listSweeps(limit?: number): Promise<SweepRun[]>;
@@ -347,7 +352,11 @@ function applyVerification(
   };
 }
 
-/** Parse seq from act_<site>_<yyyymmdd>_<seq>; null if id does not match. */
+/**
+ * Parse seq from act_<site>_<yyyymmdd>_<seq>; null if id does not match.
+ * Non-conforming ids are skipped by nextSeq; a resulting collision is caught
+ * safely by saveAction's already_exists.
+ */
 function seqFromActionId(id: string, siteId: string, dateKey: string): number | null {
   const prefix = `act_${siteId}_${dateKeyCompact(dateKey)}_`;
   if (!id.startsWith(prefix)) return null;
@@ -379,12 +388,22 @@ export interface LedgerSeed {
   sweeps?: SweepRun[];
 }
 
+/** Shared constructor option: opt-in historical fixture writes via seedAction. */
+export interface LedgerCtorOptions {
+  /** When true, seedAction may insert historical fixtures. Default false. */
+  allowSeeding?: boolean;
+}
+
 export class InMemoryLedger implements ActionLedger {
   private readonly actions = new Map<string, ActionCommitment>();
   private readonly sweeps = new Map<string, SweepRun>();
+  private readonly allowSeeding: boolean;
 
-  constructor(seed: LedgerSeed = {}) {
-    // Seed path intentionally bypasses public create guards (historical fixtures).
+  constructor(seed: LedgerSeed & LedgerCtorOptions = {}) {
+    this.allowSeeding = seed.allowSeeding === true;
+    // Constructor seed path intentionally bypasses public create guards
+    // (historical fixtures for the demo singleton). seedAction is separate
+    // and gated by allowSeeding.
     for (const a of seed.actions ?? []) {
       this.writeAction(a);
     }
@@ -403,9 +422,19 @@ export class InMemoryLedger implements ActionLedger {
 
   /**
    * Fixture/demo seed write — not on ActionLedger.
-   * Historical issued/verified/falsified rows go through here, never saveAction.
+   * Requires allowSeeding: true at construction; refuses when id already exists
+   * (insert historical fixture only — never rewrite a delivered verdict).
    */
   async seedAction(a: ActionCommitment): Promise<void> {
+    if (!this.allowSeeding) {
+      throw new LedgerError(
+        "seeding_disabled",
+        "seedAction requires allowSeeding: true at construction",
+      );
+    }
+    if (this.actions.has(a.id)) {
+      throw new LedgerError("already_exists", `Action '${a.id}' already exists`);
+    }
     this.writeAction(a);
   }
 
@@ -664,7 +693,14 @@ const ACTION_PLACEHOLDERS = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
 const SWEEP_PLACEHOLDERS = "?, ?, ?, ?, ?, ?, ?";
 
 export class D1Ledger implements ActionLedger {
-  constructor(private readonly db: D1Like) {}
+  private readonly allowSeeding: boolean;
+
+  constructor(
+    private readonly db: D1Like,
+    options: LedgerCtorOptions = {},
+  ) {
+    this.allowSeeding = options.allowSeeding === true;
+  }
 
   /**
    * Private blind upsert. Used by transitions and verification.
@@ -701,9 +737,20 @@ export class D1Ledger implements ActionLedger {
 
   /**
    * Fixture/demo seed write — not on ActionLedger.
-   * Historical issued/verified/falsified rows go through here, never saveAction.
+   * Requires allowSeeding: true at construction; refuses when id already exists
+   * (insert historical fixture only — never rewrite a delivered verdict).
    */
   async seedAction(a: ActionCommitment): Promise<void> {
+    if (!this.allowSeeding) {
+      throw new LedgerError(
+        "seeding_disabled",
+        "seedAction requires allowSeeding: true at construction",
+      );
+    }
+    const existing = await this.getAction(a.id);
+    if (existing) {
+      throw new LedgerError("already_exists", `Action '${a.id}' already exists`);
+    }
     await this.writeAction(a);
   }
 
@@ -877,14 +924,16 @@ function hasKreditLedgerBinding(env: unknown): env is { KREDIT_LEDGER: D1Like } 
  */
 export function getLedger(env?: unknown): ActionLedger {
   if (hasKreditLedgerBinding(env)) {
+    // Production D1 path: seeding stays off (default).
     return new D1Ledger(env.KREDIT_LEDGER);
   }
   if (!memorySingleton) {
     const seed = buildDemoSeed(DEMO_SEED_NOW);
-    // Constructor seed path (not public saveAction) — historical issued/graded rows.
+    // Constructor seed + allowSeeding for the local/dev demo singleton only.
     memorySingleton = new InMemoryLedger({
       actions: seed.actions,
       sweeps: seed.sweeps,
+      allowSeeding: true,
     });
   }
   return memorySingleton;
