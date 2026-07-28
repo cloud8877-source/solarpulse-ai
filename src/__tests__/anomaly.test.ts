@@ -3,11 +3,19 @@ import { InMemoryStore } from "../data/store";
 import { detectUnderperformance } from "../engine/anomaly";
 
 const store = new InMemoryStore();
-const detect = (id: string) =>
+
+/** Demo-day window (default asOfDate story). */
+const DAY4 = {
+  windowStart: "2026-06-21T00:00:00+08:00",
+  windowEnd: "2026-06-21T23:59:59+08:00",
+};
+
+const detect = (id: string, window?: { windowStart: string; windowEnd: string }) =>
   detectUnderperformance({
     site: store.getSite(id)!,
     observations: store.getObservations(id),
     weather: store.getWeather(id),
+    ...(window ?? DAY4),
   });
 
 describe("anomaly detector (PDR-004 §3)", () => {
@@ -35,5 +43,22 @@ describe("anomaly detector (PDR-004 §3)", () => {
     expect(a.qualityFlags).toContain("missing_generation");
     // residual over VALID intervals only stays mild — proving missing wasn't counted as zero
     expect(a.residualPct).toBeGreaterThan(-0.2);
+  });
+
+  it("day-scoped severities: site_b degrades; site_c day4 is data_issue", () => {
+    const day = (d: string) => ({
+      windowStart: `${d}T00:00:00+08:00`,
+      windowEnd: `${d}T23:59:59+08:00`,
+    });
+
+    expect(detect("site_b", day("2026-06-18")).severity).toBe("healthy");
+    expect(detect("site_b", day("2026-06-19")).severity).toBe("watch");
+    expect(detect("site_b", day("2026-06-20")).severity).toBe("anomaly");
+    expect(detect("site_b", day("2026-06-21")).severity).toBe("anomaly");
+
+    expect(detect("site_c", day("2026-06-18")).severity).toBe("healthy");
+    expect(detect("site_c", day("2026-06-19")).severity).toBe("healthy");
+    expect(detect("site_c", day("2026-06-20")).severity).toBe("data_issue");
+    expect(detect("site_c", day("2026-06-21")).severity).toBe("data_issue");
   });
 });

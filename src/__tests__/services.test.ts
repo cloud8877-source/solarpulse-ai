@@ -13,6 +13,41 @@ describe("SolarOps service layer (PDR-005 contracts)", () => {
     expect(b.is_fixture).toBe(true);
   });
 
+  it("default asOfDate equals latest fixture day (2026-06-21)", () => {
+    const s = svc();
+    expect(s.latestFixtureDate()).toBe("2026-06-21");
+    // No-arg calls must match explicit asOfDate=2026-06-21
+    expect(s.lookupSolarSite("site_b").latest_status).toBe(
+      s.lookupSolarSite("site_b", "2026-06-21").latest_status,
+    );
+    expect(s.detectAssetUnderperformance("site_b").anomaly_event_id).toBe(
+      s.detectAssetUnderperformance("site_b", undefined, undefined, "2026-06-21").anomaly_event_id,
+    );
+  });
+
+  it("day-scoping: site_b degrades day-by-day; site_c day4 is data_issue", () => {
+    const s = svc();
+    expect(s.detectAssetUnderperformance("site_b", undefined, undefined, "2026-06-18").severity).toBe(
+      "healthy",
+    );
+    expect(s.detectAssetUnderperformance("site_b", undefined, undefined, "2026-06-19").severity).toBe(
+      "watch",
+    );
+    expect(s.detectAssetUnderperformance("site_b", undefined, undefined, "2026-06-20").severity).toBe(
+      "anomaly",
+    );
+    expect(s.detectAssetUnderperformance("site_b", undefined, undefined, "2026-06-21").severity).toBe(
+      "anomaly",
+    );
+
+    expect(s.detectAssetUnderperformance("site_c", undefined, undefined, "2026-06-18").severity).toBe(
+      "healthy",
+    );
+    expect(s.detectAssetUnderperformance("site_c", undefined, undefined, "2026-06-21").severity).toBe(
+      "data_issue",
+    );
+  });
+
   it("forecast surfaces a reference WAPE for Site C — never a silent 0", () => {
     const f = svc().forecast("site_c", "day_ahead");
     expect(f.metric.name).toBe("fixture_wape");
@@ -47,6 +82,15 @@ describe("SolarOps service layer (PDR-005 contracts)", () => {
   it("explain/rank are robust to call order — event re-derived from its id", () => {
     const e = svc().explainSolarAnomaly("anom_site_b_20260621");
     expect(e.likely_cause).toBe("inverter_or_string_underperformance");
+  });
+
+  it("re-derives earlier-day events from day-keyed ids", () => {
+    const e = svc().explainSolarAnomaly("anom_site_b_20260619");
+    // day2 is watch → not data_issue / not healthy equipment path only
+    expect(e.likely_cause).toBeDefined();
+    const d = svc().detectAssetUnderperformance("site_b", undefined, undefined, "2026-06-19");
+    expect(d.anomaly_event_id).toBe("anom_site_b_20260619");
+    expect(d.severity).toBe("watch");
   });
 
   it("Site C explain returns telemetry/data-quality cause (CE3)", () => {

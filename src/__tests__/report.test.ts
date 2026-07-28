@@ -8,6 +8,12 @@ import { classifyRootCause } from "../engine/rootCause";
 
 const store = new InMemoryStore();
 
+/** Demo-day window (default asOfDate story). */
+const DAY4 = {
+  windowStart: "2026-06-21T00:00:00+08:00",
+  windowEnd: "2026-06-21T23:59:59+08:00",
+};
+
 describe("report generator (PDR-006 §4, PDR-007 provenance)", () => {
   it("Site B report includes manifest, assumptions, model version, and fixture label", () => {
     const site = store.getSite("site_b")!;
@@ -15,6 +21,7 @@ describe("report generator (PDR-006 §4, PDR-007 provenance)", () => {
       site,
       observations: store.getObservations("site_b"),
       weather: store.getWeather("site_b"),
+      ...DAY4,
     });
     const rootCause = classifyRootCause({ anomaly, site });
     const recommendations = rankActions({ anomaly, rootCause, site });

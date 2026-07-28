@@ -5,12 +5,20 @@ import { rankActions } from "../engine/recommend";
 import { classifyRootCause } from "../engine/rootCause";
 
 const store = new InMemoryStore();
+
+/** Demo-day window (default asOfDate story). */
+const DAY4 = {
+  windowStart: "2026-06-21T00:00:00+08:00",
+  windowEnd: "2026-06-21T23:59:59+08:00",
+};
+
 const recommend = (id: string) => {
   const site = store.getSite(id)!;
   const anomaly = detectUnderperformance({
     site,
     observations: store.getObservations(id),
     weather: store.getWeather(id),
+    ...DAY4,
   });
   const rootCause = classifyRootCause({ anomaly, site });
   return rankActions({ anomaly, rootCause, site });
