@@ -28,6 +28,9 @@ import type {
 } from "../domain/types";
 
 const REFERENCE_SITE_ID = "site_a"; // healthy reference for the model backtest WAPE
+/** Local calendar used for all detection windows (Peninsular Malaysia). */
+const LOCAL_OFFSET = "+08:00";
+const LOCAL_OFFSET_MS = 8 * 60 * 60 * 1000;
 
 export type SolarOpsErrorCode =
   | "site_not_found"
@@ -46,24 +49,65 @@ export class SolarOpsError extends Error {
   }
 }
 
-function ymd(timestamp: string): string {
-  return timestamp.slice(0, 10).replace(/-/g, "");
+function ymdCompact(isoDate: string): string {
+  return isoDate.slice(0, 10).replace(/-/g, "");
 }
 
-function anomalyEventId(siteId: string, windowStart: string): string {
-  return `anom_${siteId}_${ymd(windowStart)}`;
+function ymd(timestamp: string): string {
+  return localDateKey(timestamp).replace(/-/g, "");
+}
+
+/**
+ * Calendar day (YYYY-MM-DD) in local +08:00 for any ISO bound (Z, offset, or bare date).
+ * UTC/Z inputs are converted — e.g. 2026-06-19T20:00:00Z → 2026-06-20 in +08.
+ */
+function localDateKey(timestamp: string): string {
+  const bare = timestamp.trim();
+  // Already a calendar date (no time component).
+  if (/^\d{4}-\d{2}-\d{2}$/.test(bare)) return bare;
+  const ms = Date.parse(bare);
+  if (!Number.isFinite(ms)) {
+    // Last resort: first 10 chars if they look like a date.
+    const head = bare.slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(head) ? head : bare.slice(0, 10);
+  }
+  // Shift into +08 wall-clock, then read UTC components of the shifted instant.
+  const shifted = new Date(ms + LOCAL_OFFSET_MS);
+  const y = shifted.getUTCFullYear();
+  const m = String(shifted.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(shifted.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function anomalyEventId(siteId: string, windowStart: string, windowEnd: string): string {
+  const startDay = ymd(windowStart);
+  const endDay = ymd(windowEnd);
+  if (startDay === endDay) return `anom_${siteId}_${startDay}`;
+  return `anom_${siteId}_${startDay}_${endDay}`;
 }
 
 function siteIdFromEventId(id: string): string {
-  return id.replace(/^anom_/, "").replace(/_\d{8}$/, "");
+  // anom_<siteId>_<YYYYMMDD> or anom_<siteId>_<YYYYMMDD>_<YYYYMMDD>
+  const m = id.match(/^anom_(.+?)_(\d{8})(?:_(\d{8}))?$/);
+  return m?.[1] ?? id.replace(/^anom_/, "");
 }
 
-/** Parse YYYY-MM-DD from a day-keyed anomaly id (e.g. anom_site_b_20260621). */
+/** Parse start day (YYYY-MM-DD) from a day-keyed anomaly id. */
 function dateFromEventId(id: string): string | null {
-  const m = id.match(/_(\d{8})$/);
+  const m = id.match(/^anom_.+?_(\d{8})(?:_(\d{8}))?$/);
   if (!m) return null;
   const d = m[1]!;
   return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
+}
+
+/** Parse full local-day window from a single- or multi-day anomaly id. */
+function windowFromEventId(id: string): { startDate: string; endDate: string } | null {
+  const m = id.match(/^anom_.+?_(\d{8})(?:_(\d{8}))?$/);
+  if (!m) return null;
+  const start = m[1]!;
+  const end = m[2] ?? m[1]!;
+  const toIso = (d: string) => `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
+  return { startDate: toIso(start), endDate: toIso(end) };
 }
 
 function dateKey(timestamp: string): string {
@@ -72,8 +116,37 @@ function dateKey(timestamp: string): string {
 
 function dayWindow(asOfDate: string): { windowStart: string; windowEnd: string } {
   return {
-    windowStart: `${asOfDate}T00:00:00+08:00`,
-    windowEnd: `${asOfDate}T23:59:59+08:00`,
+    windowStart: `${asOfDate}T00:00:00${LOCAL_OFFSET}`,
+    // Inclusive end of the local calendar day (ms precision for filter ≤).
+    windowEnd: `${asOfDate}T23:59:59.999${LOCAL_OFFSET}`,
+  };
+}
+
+/**
+ * Normalize detection bounds to full local (+08:00) calendar days.
+ * Any provided bound (including Z/UTC) is converted to +08, then expanded:
+ * start → 00:00:00, end → 23:59:59.999 of their respective local days.
+ * Multi-day explicit windows remain possible after expansion.
+ */
+function normalizeDetectionWindow(
+  windowStart?: string,
+  windowEnd?: string,
+  asOfDate?: string,
+): { windowStart: string; windowEnd: string } {
+  if (!windowStart && !windowEnd) {
+    return dayWindow(asOfDate!);
+  }
+  if (windowStart && !windowEnd) {
+    return dayWindow(localDateKey(windowStart));
+  }
+  if (!windowStart && windowEnd) {
+    return dayWindow(localDateKey(windowEnd));
+  }
+  const startDay = localDateKey(windowStart!);
+  const endDay = localDateKey(windowEnd!);
+  return {
+    windowStart: dayWindow(startDay).windowStart,
+    windowEnd: dayWindow(endDay).windowEnd,
   };
 }
 
@@ -167,7 +240,7 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
   function persistEvent(siteId: string, anomaly: AnomalyResult, site: ReturnType<typeof requireSite>): AnomalyEvent {
     const rootCause = classifyRootCause({ anomaly, site });
     const event: AnomalyEvent = {
-      id: anomalyEventId(siteId, anomaly.windowStart),
+      id: anomalyEventId(siteId, anomaly.windowStart, anomaly.windowEnd),
       siteId,
       windowStart: anomaly.windowStart,
       windowEnd: anomaly.windowEnd,
@@ -202,18 +275,12 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     }
 
     // Explicit windows win; otherwise scope to asOfDate (default = latest fixture day).
-    // A lone bound always scopes to that single local (+08:00) day — never open-ended.
-    let start = windowStart;
-    let end = windowEnd;
-    if (!start && !end) {
-      const bounds = dayWindow(resolveAsOfDate(asOfDate));
-      start = bounds.windowStart;
-      end = bounds.windowEnd;
-    } else if (start && !end) {
-      end = dayWindow(dateKey(start)).windowEnd;
-    } else if (!start && end) {
-      start = dayWindow(dateKey(end)).windowStart;
-    }
+    // ALL bounds normalize to full local (+08:00) calendar days (R1/R2).
+    const { windowStart: start, windowEnd: end } = normalizeDetectionWindow(
+      windowStart,
+      windowEnd,
+      resolveAsOfDate(asOfDate),
+    );
 
     // Scope observations + weather to the same window before the engine runs
     // (weatherNormal / weather_unavailable must not mix cross-day means).
@@ -222,12 +289,12 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
 
     // Empty window → data_issue (same convention as lookupSolarSite empty day), never "healthy".
     if (observations.length === 0) {
-      const flags: QualityFlag[] = [];
+      const flags: QualityFlag[] = ["missing_generation"];
       if (site.isFixture) flags.push("fixture_data");
       const anomaly: AnomalyResult = {
         siteId,
-        windowStart: start!,
-        windowEnd: end!,
+        windowStart: start,
+        windowEnd: end,
         observedKwh: 0,
         expectedKwh: 0,
         residualKwh: 0,
@@ -251,8 +318,8 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
       site,
       observations,
       weather,
-      ...(start ? { windowStart: start } : {}),
-      ...(end ? { windowEnd: end } : {}),
+      windowStart: start,
+      windowEnd: end,
     });
     return persistEvent(siteId, anomaly, site);
   }
@@ -264,9 +331,19 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     if (existing) return existing;
     const siteId = siteIdFromEventId(anomalyEventId);
     if (store.getSite(siteId)) {
-      const date = dateFromEventId(anomalyEventId);
-      const derived = date ? detectEvent(siteId, undefined, undefined, date) : detectEvent(siteId);
-      if (derived.id === anomalyEventId) return derived;
+      const win = windowFromEventId(anomalyEventId);
+      if (win) {
+        const bounds = {
+          start: dayWindow(win.startDate).windowStart,
+          end: dayWindow(win.endDate).windowEnd,
+        };
+        const derived = detectEvent(siteId, bounds.start, bounds.end);
+        if (derived.id === anomalyEventId) return derived;
+      } else {
+        const date = dateFromEventId(anomalyEventId);
+        const derived = date ? detectEvent(siteId, undefined, undefined, date) : detectEvent(siteId);
+        if (derived.id === anomalyEventId) return derived;
+      }
     }
     throw new SolarOpsError("anomaly_not_found", `Unknown anomaly event '${anomalyEventId}'.`);
   }
@@ -396,7 +473,7 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     const anomaly = eventToAnomalyResult(ev);
     const rootCause = eventToRootCause(ev);
     const recommendations = rankActions({ anomaly, rootCause, site });
-    const reportId = `report_${siteId}_${ymd(ev.windowStart)}`;
+    const reportId = `report_${siteId}_${ymd(ev.windowStart)}`; // ymd already local-day compact
     const manifest = buildSourceManifest({
       runId: reportId,
       inputs: [
@@ -436,7 +513,7 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     const ev = detectEvent(siteId, undefined, undefined, day);
     const anomaly = eventToAnomalyResult(ev);
     const rootCause = eventToRootCause(ev);
-    const reportId = `gpr_${siteId}_${ymd(ev.windowStart)}`;
+    const reportId = `gpr_${siteId}_${ymdCompact(day)}`;
     const manifest = buildSourceManifest({
       runId: reportId,
       inputs: [
@@ -446,6 +523,45 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
       ],
       ...(now ? { now } : {}),
     });
+
+    // Day-scoped production split + measurable coverage for valuation / notes.
+    const dayObs = filterByDate(store.getObservations(siteId), day);
+    const dayWx = filterByDate(store.getWeather(siteId), day);
+    const expIntervals = expectedProfile(site, dayWx);
+    const expByTs = new Map(expIntervals.map((i) => [i.timestamp, i.expectedKwh]));
+    let genSum = 0;
+    let exportSum = 0;
+    let measurableIntervals = 0;
+    let validMeasurableIntervals = 0;
+    for (const i of expIntervals) {
+      if (i.expectedKwh > 0) measurableIntervals += 1;
+    }
+    for (const o of dayObs) {
+      if (o.generationKwh != null) genSum += o.generationKwh;
+      if (o.exportKwh != null) exportSum += o.exportKwh;
+      const exp = expByTs.get(o.timestamp) ?? 0;
+      if (exp > 0) {
+        if (o.generationKwh != null) validMeasurableIntervals += 1;
+      }
+    }
+    const selfConsumedKwh = genSum - exportSum;
+
+    // ATAP eligibility + preceding-month SMP (same resolution as atapCreditClock).
+    const atapEligible = site.capacityKwp <= assumptions.atap.nonDomesticCapKwac;
+    let averageSmpRmPerKwh: number | undefined;
+    if (atapEligible) {
+      const y = Number(day.slice(0, 4));
+      const m = Number(day.slice(5, 7));
+      const prevMonth = m === 1 ? 12 : m - 1;
+      const prevYear = m === 1 ? y - 1 : y;
+      const smpMonthLabel = `${prevYear}-${String(prevMonth).padStart(2, "0")}`;
+      const smpEntry =
+        assumptions.atap.averageSmpByMonth[
+          smpMonthLabel as keyof typeof assumptions.atap.averageSmpByMonth
+        ];
+      if (smpEntry) averageSmpRmPerKwh = smpEntry.rmPerKwh;
+    }
+
     const { report, data } = generateGreenReport({
       site,
       anomaly,
@@ -454,6 +570,12 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
       reportId,
       anomalyEventId: ev.id,
       ...(now ? { now } : {}),
+      atapEligible,
+      ...(averageSmpRmPerKwh != null ? { averageSmpRmPerKwh } : {}),
+      selfConsumedKwh,
+      exportedKwh: exportSum,
+      measurableIntervals,
+      validMeasurableIntervals,
     });
     store.saveReport(report);
     return {
@@ -500,8 +622,9 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
    * ATAP credit-clock for a site (KREDIT / I2).
    * Billing period = calendar month of asOfDate; Average SMP = PRECEDING month entry.
    * Pure engine math + SourceManifest provenance; no HTTP route in this increment.
+   * DTO is fully snake_case (matches every other service method).
    */
-  function atapCreditClock(siteId: string, asOfDate?: string) {
+  function atapCreditClock(siteId: string, asOfDate?: string, now?: string) {
     const site = requireSite(siteId);
     const day = resolveAsOfDate(asOfDate);
     const { periodStart, periodEnd } = billingPeriodBounds(day);
@@ -537,6 +660,7 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
         id: site.id,
         capacityKwp: site.capacityKwp,
         tariffRmPerKwh: tariff,
+        tariffCategory: site.tariffCategory,
       },
       observations,
       asOfDate: day,
@@ -590,11 +714,57 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
           note: "Gazette GP/ST/No.60/2025 section 2 MAQ definition",
         },
       ],
+      ...(now ? { now } : {}),
     });
 
+    // Normalize to snake_case DTO (every other service method uses this convention).
     return {
       site_id: siteId,
-      ...result,
+      eligibility: {
+        eligible: result.eligibility.eligible,
+        reason: result.eligibility.reason,
+      },
+      coverage: {
+        period_start: result.coverage.periodStart,
+        period_end: result.coverage.periodEnd,
+        days_in_period: result.coverage.daysInPeriod,
+        observed_days: result.coverage.observedDays,
+        as_of_date: result.coverage.asOfDate,
+        days_remaining: result.coverage.daysRemaining,
+      },
+      observed_to_date: {
+        generation_kwh: result.observedToDate.generationKwh,
+        load_kwh: result.observedToDate.loadKwh,
+        import_kwh: result.observedToDate.importKwh,
+        export_kwh: result.observedToDate.exportKwh,
+        self_consumed_kwh: result.observedToDate.selfConsumedKwh,
+        self_consumption_ratio: result.observedToDate.selfConsumptionRatio,
+      },
+      maq_kwh: result.maqKwh,
+      projection: result.projection
+        ? {
+            method: result.projection.method,
+            observed_days: result.projection.observedDays,
+            export_kwh: result.projection.exportKwh,
+            import_kwh: result.projection.importKwh,
+            offsettable_export_kwh: result.projection.offsettableExportKwh,
+            forfeited_export_kwh: result.projection.forfeitedExportKwh,
+            credit_rm: result.projection.creditRm,
+            forfeited_credit_rm: result.projection.forfeitedCreditRm,
+            energy_charge_rm: result.projection.energyChargeRm,
+            net_energy_charge_rm: result.projection.netEnergyChargeRm,
+          }
+        : null,
+      value_leak: result.valueLeak
+        ? {
+            smp_spread_rm: result.valueLeak.smpSpreadRm,
+            forfeited_credit_rm: result.valueLeak.forfeitedCreditRm,
+            floored_credit_lost_rm: result.valueLeak.flooredCreditLostRm,
+            total_rm: result.valueLeak.totalRm,
+          }
+        : null,
+      projection_unavailable_reason: result.projectionUnavailableReason,
+      assumptions: result.assumptions,
       source_manifest: manifest,
     };
   }

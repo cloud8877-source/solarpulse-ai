@@ -93,13 +93,13 @@ export const detectAssetUnderperformanceTool = tool({
       .string()
       .optional()
       .describe(
-        "Inclusive window start (ISO timestamp). When provided without window_end, scopes to that single local (+08:00) day.",
+        "Window start (ISO timestamp or YYYY-MM-DD). Detection windows are day-granular: the bound is converted to local (+08:00) and expanded to 00:00:00 of that calendar day. UTC/Z inputs are converted (e.g. 2026-06-19T20:00:00Z → 2026-06-20 in +08). Alone, scopes to that single local day.",
       ),
     window_end: z
       .string()
       .optional()
       .describe(
-        "Inclusive window end (ISO timestamp). When provided without window_start, scopes to that single local (+08:00) day.",
+        "Window end (ISO timestamp or YYYY-MM-DD). Converted to local (+08:00) and expanded to 23:59:59.999 of that calendar day. Alone, scopes to that single local day. With window_start, multi-day windows are allowed (event id anom_<site>_<startday>_<endday>).",
       ),
   }),
   outputSchema: z.object({
