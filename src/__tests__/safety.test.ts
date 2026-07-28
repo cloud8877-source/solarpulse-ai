@@ -16,10 +16,12 @@ beforeAll(() => {
 
 describe("safety: numeric grounding (ADR-0005, CE4)", () => {
   it("passes an answer whose numbers all trace to tool outputs", () => {
+    // Numbers must match live tool outputs for site_b day-4 (24h fixtures; night zeros
+    // leave residual kWh unchanged; RM uses site tariff 0.2983).
     const answer =
-      "Site B observed 12,173 kWh versus an expected 13,681 kWh — an 11.0% shortfall. " +
-      "Likely inverter 3 underperformance. Estimated recovery 21,724 kWh/month " +
-      "(RM 10,862, 14,121 kg CO₂), subject to field verification.";
+      "Site B observed 12,172.58 kWh versus an expected 13,681.21 kWh — an 11.0% shortfall. " +
+      "Likely inverter 3 underperformance. Estimated recovery 21,724.27 kWh/month " +
+      "(RM 6,480.35, 14,164.23 kg CO₂), subject to field verification.";
     const res = validateAnswer(answer, toolOutputs);
     expect(res.ok).toBe(true);
     expect(res.grounded).toBe(true);
@@ -49,7 +51,7 @@ describe("safety: numeric grounding (ADR-0005, CE4)", () => {
   it("does NOT flag a compliant refusal that negates dispatch/savings", () => {
     const answer =
       "No crew has been dispatched, and I cannot guarantee any savings. " +
-      "The tools show an 11.0% shortfall (12,173 vs 13,681 kWh); I recommend inspecting inverter 3.";
+      "The tools show an 11.0% shortfall (12,172.58 vs 13,681.21 kWh); I recommend inspecting inverter 3.";
     const res = validateAnswer(answer, toolOutputs);
     expect(res.blockedPhrases).toHaveLength(0);
     expect(res.ok).toBe(true);

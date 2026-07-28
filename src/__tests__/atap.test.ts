@@ -325,7 +325,6 @@ describe("ATAP credit-clock service integration (fixtures)", () => {
     expect(result.eligibility.eligible).toBe(true); // 850 kWp ≤ 1000
 
     // Recompute observed sums from fixture observations (test-side, not engine).
-    const site = store.getSite("site_a")!;
     const day = "2026-06-21";
     const periodStart = "2026-06-01";
     const obsRows = store.getObservations("site_a").filter((o) => {
@@ -353,39 +352,30 @@ describe("ATAP credit-clock service integration (fixtures)", () => {
     expect(result.observedToDate.importKwh).toBe(round(imp));
     expect(result.observedToDate.exportKwh).toBe(round(exp));
     expect(result.observedToDate.selfConsumedKwh).toBe(round(gen - exp));
+    // Store-summed anchors for the pinned projection comments below.
+    expect(round(exp)).toBe(8446.51);
+    expect(round(imp)).toBe(6308.38);
 
     // MAQ = 850 × 5 × 30 = 127_500
     expect(result.maqKwh).toBe(127_500); // 850 × 5 × 30
 
-    // Linear daily-mean projection (test-side arithmetic).
-    const daysInPeriod = 30;
-    const projExp = (exp / observedDays) * daysInPeriod;
-    const projImp = (imp / observedDays) * daysInPeriod;
-    const smp = assumptions.atap.averageSmpByMonth["2026-05"]!.rmPerKwh; // 0.1893
-    const retail = site.tariffAssumptionRmPerKwh ?? assumptions.retailTariffRmPerKwh; // 0.2703
-    const offsettable = Math.min(projExp, projImp, 127_500);
-    const forfeited = projExp - offsettable;
-    const creditRm = offsettable * smp;
-    const forfeitedCreditRm = forfeited * smp;
-    const energyChargeRm = projImp * retail;
-    const net = Math.max(0, energyChargeRm - creditRm);
-    const smpSpreadRm = offsettable * (retail - smp);
-    const totalLeak = smpSpreadRm + forfeitedCreditRm;
-
+    // PINNED projection outputs — hand-derived from daily-mean arithmetic on the
+    // store-summed observed block above (24h fixtures, I2b-1). Do not recompute
+    // from the engine; these literals fail if the formula drifts.
     expect(result.projection).not.toBeNull();
     expect(result.projection!.method).toBe("linear_daily_mean");
     expect(result.projection!.observedDays).toBe(4);
-    expect(result.projection!.exportKwh).toBe(round(projExp));
-    expect(result.projection!.importKwh).toBe(round(projImp));
-    expect(result.projection!.offsettableExportKwh).toBe(round(offsettable));
-    expect(result.projection!.forfeitedExportKwh).toBe(round(forfeited));
-    expect(result.projection!.creditRm).toBe(round(creditRm));
-    expect(result.projection!.forfeitedCreditRm).toBe(round(forfeitedCreditRm));
-    expect(result.projection!.energyChargeRm).toBe(round(energyChargeRm));
-    expect(result.projection!.netEnergyChargeRm).toBe(round(net));
-    expect(result.valueLeak!.smpSpreadRm).toBe(round(smpSpreadRm));
-    expect(result.valueLeak!.forfeitedCreditRm).toBe(round(forfeitedCreditRm));
-    expect(result.valueLeak!.totalRm).toBe(round(totalLeak));
+    expect(result.projection!.exportKwh).toBe(63348.82); // (8446.51/4)×30 → 63348.825
+    expect(result.projection!.importKwh).toBe(47312.85); // (6308.38/4)×30
+    expect(result.projection!.offsettableExportKwh).toBe(47312.85); // min(63348.825, 47312.85, 127500)
+    expect(result.projection!.forfeitedExportKwh).toBe(16035.97); // 63348.825 − 47312.85
+    expect(result.projection!.creditRm).toBe(8956.32); // 47312.85 × 0.1893
+    expect(result.projection!.forfeitedCreditRm).toBe(3035.61); // 16035.975 × 0.1893
+    expect(result.projection!.energyChargeRm).toBe(12788.66); // 47312.85 × 0.2703
+    expect(result.projection!.netEnergyChargeRm).toBe(3832.34); // max(0, 12788.663 − 8956.323)
+    expect(result.valueLeak!.smpSpreadRm).toBe(3832.34); // 47312.85 × (0.2703 − 0.1893)
+    expect(result.valueLeak!.forfeitedCreditRm).toBe(3035.61); // same as projection.forfeitedCreditRm
+    expect(result.valueLeak!.totalRm).toBe(6867.95); // 3832.341 + 3035.610
 
     // Manifest labels May 2026 SMP as manual_assumption.
     const smpInput = result.source_manifest.inputs.find((i) => i.name === "average_smp");
@@ -400,6 +390,13 @@ describe("ATAP credit-clock service integration (fixtures)", () => {
     expect(result.eligibility.reason).toContain("exceeds 1,000 kWac");
     expect(result.projection).toBeNull();
     expect(result.valueLeak).toBeNull();
+  });
+
+  it("site_c (950 kWp) is ATAP-eligible under the 1,000 kWac cap", () => {
+    const result = svc().atapCreditClock("site_c");
+    expect(result.eligibility.eligible).toBe(true);
+    expect(result.eligibility.reason).toBeNull();
+    expect(result.projection).not.toBeNull();
   });
 
   it("throws smp_unavailable when preceding-month SMP entry is missing", () => {

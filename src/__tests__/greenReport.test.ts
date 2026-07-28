@@ -59,9 +59,9 @@ describe("Green Performance Report (GPR)", () => {
 
     expect(rep.content).toMatch(/\*\*Status:\*\* data_issue/);
     expect(rep.data.incidents.severity).toBe("data_issue");
-    // Interval coverage caveat next to observed figure (8 of 11 valid intervals).
-    expect(rep.content).toContain("based on 8 of 11 valid intervals");
-    expect(rep.data.production.coverageNote).toBe("based on 8 of 11 valid intervals");
+    // Interval coverage caveat next to observed figure (20 of 24 valid — 4 missing daylight of 24h).
+    expect(rep.content).toContain("based on 20 of 24 valid intervals");
+    expect(rep.data.production.coverageNote).toBe("based on 20 of 24 valid intervals");
     // Evidence lines from root cause (symmetric with anomalous branch).
     expect(rep.content).toContain("Evidence:");
     expect(rep.data.incidents.evidence.length).toBeGreaterThan(0);

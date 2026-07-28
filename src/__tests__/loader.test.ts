@@ -28,16 +28,16 @@ describe("fixture loader (P1 data spine)", () => {
     const byId = Object.fromEntries(sites.map((s) => [s.id, s]));
     expect(byId.site_a!.capacityKwp).toBe(850);
     expect(byId.site_b!.capacityKwp).toBe(2500);
-    expect(byId.site_c!.capacityKwp).toBe(1200);
+    expect(byId.site_c!.capacityKwp).toBe(950);
     expect(byId.site_a!.performanceRatio).toBeCloseTo(0.78);
   });
 
-  it("loads 3 sites × 11 hours × 4 days of solar and weather observations", () => {
-    expect(loadObservations().length).toBe(3 * 11 * 4);
-    expect(loadWeather().length).toBe(3 * 11 * 4);
+  it("loads 3 sites × 24 hours × 4 days of solar and weather observations", () => {
+    expect(loadObservations().length).toBe(3 * 24 * 4);
+    expect(loadWeather().length).toBe(3 * 24 * 4);
     for (const id of ["site_a", "site_b", "site_c"]) {
-      expect(loadObservations().filter((o) => o.siteId === id).length).toBe(44);
-      expect(loadWeather().filter((w) => w.siteId === id).length).toBe(44);
+      expect(loadObservations().filter((o) => o.siteId === id).length).toBe(96);
+      expect(loadWeather().filter((w) => w.siteId === id).length).toBe(96);
     }
   });
 
@@ -108,7 +108,7 @@ describe("fixture loader (P1 data spine)", () => {
     const store = new InMemoryStore();
     expect(store.listSites().length).toBe(3);
     const obs = store.getObservations("site_b");
-    expect(obs.length).toBe(44);
+    expect(obs.length).toBe(96);
     const timestamps = obs.map((o) => o.timestamp);
     expect(timestamps).toEqual([...timestamps].sort());
   });

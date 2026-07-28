@@ -30,7 +30,7 @@ describe("forecast baseline (PDR-004 §2)", () => {
     expect(f.metric.value).toBeGreaterThanOrEqual(0);
     expect(f.metric.value).toBeLessThan(0.05);
     expect(f.qualityFlags).toContain("fixture_data");
-    expect(f.intervals.length).toBe(11);
+    expect(f.intervals.length).toBe(24);
   });
 
   it("never reports a silent 0 (perfect) WAPE for an unmeasurable site (Site C)", () => {

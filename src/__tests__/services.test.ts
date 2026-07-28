@@ -84,6 +84,41 @@ describe("SolarOps service layer (PDR-005 contracts)", () => {
     expect(byDate.evidence).toEqual(byWindow.evidence);
     expect(byDate.observed_kwh).toBe(byWindow.observed_kwh);
     expect(byDate.severity).toBe(byWindow.severity);
+
+    // R3 / I2b-1: site_a day-2 is distinctly cloudier (0.45 vs usual 0.20).
+    // Day-scoped detect must reflect that day's cloud, not the 4-day mean.
+    const store = new InMemoryStore();
+    const wxA = store.getWeather("site_a");
+    const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+    const day2Clouds = wxA
+      .filter((w) => w.timestamp.startsWith("2026-06-19"))
+      .map((w) => w.cloudCover!)
+      .filter((c): c is number => c != null);
+    const allClouds = wxA.map((w) => w.cloudCover!).filter((c): c is number => c != null);
+    const day2MeanCloud = mean(day2Clouds);
+    const multiDayMeanCloud = mean(allClouds);
+    expect(day2MeanCloud).toBeCloseTo(0.45, 5);
+    // Would-be unscoped mean mixes clear days — must differ from day-2's value.
+    expect(multiDayMeanCloud).not.toBeCloseTo(day2MeanCloud, 5);
+    expect(multiDayMeanCloud).toBeLessThan(day2MeanCloud);
+
+    const day2 = s.detectAssetUnderperformance("site_a", undefined, undefined, "2026-06-19");
+    const day2Win = s.detectAssetUnderperformance(
+      "site_a",
+      "2026-06-19T00:00:00+08:00",
+      "2026-06-19T23:59:59+08:00",
+    );
+    expect(day2.evidence).toEqual(day2Win.evidence);
+    // Day-2 cloud 0.45 < 0.6 → weatherNormal true when scoped; residual healthy
+    // because generation drops with the cloudier irradiance (weather explains it).
+    expect(day2.evidence.weatherNormal).toBe(true);
+    expect(day2.severity).toBe("healthy");
+    expect(day2.residual_pct).toBeGreaterThan(-0.05);
+    // Cloudier day-2 expected kWh is below clear day-1 — proves weather day-scoping
+    // (unscoped multi-day weather would still match timestamps, but day-1 comparison
+    // locks the fixture cloud→irradiance coupling the service must honour).
+    const day1 = s.detectAssetUnderperformance("site_a", undefined, undefined, "2026-06-18");
+    expect(day2.expected_kwh).toBeLessThan(day1.expected_kwh);
   });
 
   // F4: empty window must not fabricate high-confidence healthy / weather_explained.
