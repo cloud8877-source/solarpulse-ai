@@ -14,7 +14,7 @@ interface Candidate {
 }
 
 function impact(residualKwhPerDay: number, site: Site, recoverableFraction: number) {
-  const tariff = site.tariffAssumptionRmPerKwh ?? A.tariffRmPerKwh;
+  const tariff = site.tariffAssumptionRmPerKwh ?? A.retailTariffRmPerKwh;
   const carbon = site.carbonFactorKgco2PerKwh ?? A.carbonFactorKgco2PerKwh;
   const recoveryKwhMonth =
     Math.abs(residualKwhPerDay) * A.recovery.recurrenceDaysPerMonth * recoverableFraction;

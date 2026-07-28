@@ -8,9 +8,16 @@ import type {
   Observation,
   QualityFlag,
   Site,
+  TariffCategory,
   Weather,
 } from "../domain/types";
 import { FIXTURE_CSV } from "./fixtures.gen";
+
+function tariffCategory(s: string | undefined): TariffCategory {
+  const t = (s ?? "").trim();
+  if (t === "mv_general") return "mv_general";
+  return "lv_general";
+}
 
 // CSV text is embedded at build time via `npm run embed:fixtures` so this module
 // has no Node filesystem dependency and can run on Cloudflare Workers.
@@ -71,6 +78,7 @@ export function loadSites(): Site[] {
     tariffAssumptionRmPerKwh: num(r.tariff_assumption_rm_per_kwh),
     carbonFactorKgco2PerKwh: num(r.carbon_factor_kgco2_per_kwh),
     performanceRatio: num(r.performance_ratio) ?? 0.78,
+    tariffCategory: tariffCategory(r.tariff_category),
     source: r.source!,
     isFixture: bool(r.is_fixture),
   }));
@@ -82,6 +90,10 @@ export function loadObservations(): Observation[] {
     siteId: r.site_id!,
     timestamp: r.timestamp!,
     generationKwh: num(r.generation_kwh), // null when missing — preserved deliberately
+    // load / import / export: empty CSV fields stay null (never coerced to 0)
+    loadKwh: num(r.load_kwh),
+    importKwh: num(r.import_kwh),
+    exportKwh: num(r.export_kwh),
     inverterId: strOrNull(r.inverter_id),
     stringId: strOrNull(r.string_id),
     availability: num(r.availability),

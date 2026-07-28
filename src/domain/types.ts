@@ -17,6 +17,9 @@ export type Horizon = "day_ahead" | "week_ahead" | "custom";
 export type GridHorizon = "current" | "day_ahead" | "week_ahead";
 export type ReportFormat = "markdown" | "pdf";
 
+/** TNB tariff category for volumetric / demand-charge valuation. */
+export type TariffCategory = "lv_general" | "mv_general";
+
 // Quality flags: the PDR-003 §5 set plus the extra labels present in the fixtures.
 export type QualityFlag =
   | "missing_generation"
@@ -58,6 +61,8 @@ export interface Site {
   tariffAssumptionRmPerKwh: number | null;
   carbonFactorKgco2PerKwh: number | null;
   performanceRatio: number;
+  /** TNB tariff category (lv_general / mv_general); drives avoided-cost stack. */
+  tariffCategory: TariffCategory;
   source: string;
   isFixture: boolean;
 }
@@ -67,6 +72,12 @@ export interface Observation {
   siteId: string;
   timestamp: string; // ISO 8601 with +08:00 offset
   generationKwh: number | null; // null = missing telemetry (must never be treated as 0)
+  /** On-site load (kWh). Empty CSV → null, never coerced to 0. */
+  loadKwh: number | null;
+  /** Grid import (kWh). Empty CSV → null, never coerced to 0. */
+  importKwh: number | null;
+  /** Grid export (kWh). Empty CSV → null, never coerced to 0. */
+  exportKwh: number | null;
   inverterId: string | null;
   stringId: string | null;
   availability: number | null;

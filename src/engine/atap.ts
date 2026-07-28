@@ -1,0 +1,587 @@
+/**
+ * Solar ATAP credit-clock engine — pure, deterministic, no I/O (ADR-0005).
+ *
+ * Regulatory basis — Malaysia Solar ATAP, gazette GP/ST/No.60/2025
+ * (Suruhanjaya Tenaga, effective 1 Jan 2026, Peninsular Malaysia):
+ * https://www.st.gov.my/sites/default/files/2026-03/GUIDELINES-FOR-SOLAR-ACCELERATED_0.pdf
+ *
+ * Clauses implemented (full sequence; the math is correct and matches these):
+ *
+ * - Section 2 definition: Non-Domestic exported energy is credited at Average SMP
+ *   = monthly average System Marginal Price for 07:00–19:00 of the PRECEDING
+ *   calendar month (price known at billing-period start; callers pass that entry).
+ *
+ * - Clause 3.6.1(b): "The exported Energy, up to the MAQ, may be used to offset
+ *   the electricity imported or consumed from the EUC within the same Billing
+ *   Period. Any exported energy that remains unutilized for offset purposes in
+ *   the same Billing Period shall not be carried forward to subsequent billing
+ *   periods and shall be deemed forfeited."
+ *
+ * - Settlement clause (d): "If the Energy exported exceeds the electricity
+ *   consumed from the EUC or the MAQ, whichever is lower, during the Billing
+ *   Period, such excess of the exported energy shall be forfeited."
+ *   Implemented as offsettableExport = min(export, import, MAQ); remainder forfeited.
+ *
+ * - Pricing (Pricing and Tariff section), applied to the TRIMMED (offsettable) export:
+ *   "Net Energy charge (RM) = (Energy imported × prevailing gazetted Energy rate)
+ *    − (Energy export × Average SMP)"
+ *
+ * - Clause (e): negative net floored at zero (no cash out). The floor is normally
+ *   unreachable for non-domestic (SMP < retail energy rate after the kWh trim) but
+ *   kept per clause (e); reachable for domestic (credit rate = Energy Charge) and
+ *   for synthetic low-tariff cases. Credit lost above the bill is tracked as
+ *   valueLeak.flooredCreditLostRm.
+ *
+ * - MAQ = capacity (kWac) × 5 sun-hours × days in Billing Period (section 2).
+ * - Credits cannot offset the AFA (Automatic Fuel Adjustment) component — this
+ *   engine models the energy charge only for the bill; SMP-spread value-leak uses
+ *   the full LV volumetric stack (energy + capacity + network) as the avoided-cost
+ *   rate for LV sites (operational self-consumption value), or the energy charge
+ *   alone for MV (capacity/network are RM/kW demand charges, not volumetric).
+ * - Eligibility (non-domestic): PV capacity up to 100% of Maximum Demand, HARD CAP
+ *   1,000 kWac. Capacity fields here are kWp used as a kWac proxy (stated assumption).
+ */
+
+import type { Assumptions } from "../config/assumptions";
+import type { Observation, SourceType, TariffCategory } from "../domain/types";
+import { round } from "./math";
+
+export interface AtapSiteInput {
+  id: string;
+  capacityKwp: number;
+  /** Resolved retail energy rate for this site (RM/kWh) — bill energy charge. */
+  tariffRmPerKwh: number;
+  /** Tariff category for avoided-cost stack selection (default lv_general). */
+  tariffCategory?: TariffCategory;
+}
+
+export interface AtapAverageSmp {
+  rmPerKwh: number;
+  /** Preceding calendar month label, e.g. "2026-05". */
+  monthLabel: string;
+  provenance: SourceType;
+  source: string;
+}
+
+export interface AtapCreditClockInput {
+  site: AtapSiteInput;
+  /** Site observations already scoped to the billing period up to asOfDate. */
+  observations: Observation[];
+  asOfDate: string; // YYYY-MM-DD
+  averageSmp: AtapAverageSmp;
+  assumptions: Assumptions;
+  /**
+   * Expected generation (kWh) per observation timestamp — from the forecast
+   * engine's expectedProfile (same map the detection / green-report paths use).
+   * Daylight-concurrent intervals are those with expected > 0 (green-report
+   * measurable-interval predicate). Missing keys treat as 0 (not daylight).
+   */
+  expectedKwhByTimestamp: Record<string, number> | Map<string, number>;
+}
+
+export interface AtapEligibility {
+  eligible: boolean;
+  reason: string | null;
+}
+
+export interface AtapCoverage {
+  periodStart: string;
+  periodEnd: string;
+  daysInPeriod: number;
+  /**
+   * Distinct days where any of load / import / export is non-null.
+   * Daily-mean projections only use rows belonging to these counted days.
+   */
+  observedDays: number;
+  asOfDate: string;
+  /** Calendar days from asOfDate to periodEnd (inclusive of end, exclusive of asOf). */
+  daysRemaining: number;
+}
+
+export interface AtapObservedToDate {
+  generationKwh: number;
+  loadKwh: number;
+  importKwh: number;
+  exportKwh: number;
+  selfConsumedKwh: number;
+  /** null when generation is 0. */
+  selfConsumptionRatio: number | null;
+}
+
+export interface AtapProjection {
+  method: "linear_daily_mean";
+  observedDays: number;
+  exportKwh: number;
+  importKwh: number;
+  offsettableExportKwh: number;
+  forfeitedExportKwh: number;
+  creditRm: number;
+  forfeitedCreditRm: number;
+  energyChargeRm: number;
+  netEnergyChargeRm: number;
+  /** Observed import on counted-day intervals with expected generation > 0. */
+  observedDaylightImportKwh: number;
+  /** Linear projection of daylight-concurrent import to the full billing period. */
+  projectedDaylightImportKwh: number;
+  /**
+   * Export kWh that could honestly be recovered by scheduling load into
+   * production hours: min(offsettableExport, projectedDaylightImport).
+   */
+  loadShiftableExportKwh: number;
+}
+
+export interface AtapValueLeak {
+  /**
+   * Headline recoverable SMP-spread (RM): load-shiftable export × (avoided − SMP).
+   * Bounded by daylight-concurrent import — no storage assumed.
+   */
+  smpSpreadRm: number;
+  /**
+   * Ceiling if ALL offsettable export could be self-consumed (storage / overnight
+   * shift). Not achievable by daytime scheduling alone; excluded from totalRm.
+   */
+  smpSpreadCeilingRm: number;
+  forfeitedCreditRm: number;
+  /** Credit that would have pushed the net bill below zero (clause (e) floor). */
+  flooredCreditLostRm: number;
+  /** Recoverable "RM evaporating" = smpSpreadRm + forfeitedCreditRm + flooredCreditLostRm. */
+  totalRm: number;
+}
+
+export type AtapProjectionUnavailableReason = "insufficient_data";
+
+export interface AtapCreditClockResult {
+  eligibility: AtapEligibility;
+  coverage: AtapCoverage;
+  observedToDate: AtapObservedToDate;
+  maqKwh: number;
+  /** null when the site is ineligible or observedDays === 0. */
+  projection: AtapProjection | null;
+  /** null when the site is ineligible or observedDays === 0. */
+  valueLeak: AtapValueLeak | null;
+  /**
+   * Set when projection is null for a non-eligibility reason (e.g. zero coverage).
+   * Ineligible sites leave this null (reason is on eligibility).
+   */
+  projectionUnavailableReason: AtapProjectionUnavailableReason | null;
+  assumptions: string[];
+}
+
+function ymdParts(isoDate: string): { year: number; month: number; day: number } {
+  return {
+    year: Number(isoDate.slice(0, 4)),
+    month: Number(isoDate.slice(5, 7)),
+    day: Number(isoDate.slice(8, 10)),
+  };
+}
+
+/** Days in the calendar month of YYYY-MM-DD (UTC date arithmetic — fixtures are +08:00 dates). */
+export function daysInCalendarMonth(isoDate: string): number {
+  const { year, month } = ymdParts(isoDate);
+  // Date.UTC(year, month, 0) = last day of previous month; month is 1-indexed here so month is correct.
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+export function billingPeriodBounds(asOfDate: string): {
+  periodStart: string;
+  periodEnd: string;
+  daysInPeriod: number;
+} {
+  const { year, month } = ymdParts(asOfDate);
+  const daysInPeriod = daysInCalendarMonth(asOfDate);
+  const mm = String(month).padStart(2, "0");
+  return {
+    periodStart: `${year}-${mm}-01`,
+    periodEnd: `${year}-${mm}-${String(daysInPeriod).padStart(2, "0")}`,
+    daysInPeriod,
+  };
+}
+
+/** Whole calendar days from `from` to `to` (YYYY-MM-DD), can be negative if from > to. */
+export function calendarDaysBetween(from: string, to: string): number {
+  const a = ymdParts(from);
+  const b = ymdParts(to);
+  const msA = Date.UTC(a.year, a.month - 1, a.day);
+  const msB = Date.UTC(b.year, b.month - 1, b.day);
+  return Math.round((msB - msA) / 86_400_000);
+}
+
+function dateKey(timestamp: string): string {
+  return timestamp.slice(0, 10);
+}
+
+function sumNullable(values: Array<number | null | undefined>): number {
+  let total = 0;
+  for (const v of values) {
+    if (v != null) total += v;
+  }
+  return total;
+}
+
+function expectedAt(
+  map: Record<string, number> | Map<string, number>,
+  timestamp: string,
+): number {
+  if (map instanceof Map) return map.get(timestamp) ?? 0;
+  return map[timestamp] ?? 0;
+}
+
+/** Full LV volumetric stack (energy + capacity + network), RM/kWh. */
+export function lvVolumetricStackRmPerKwh(A: Assumptions): number {
+  const c = A.lvVolumetricComponents;
+  // 4 dp matches the component literals (0.2703 + 0.0883 + 0.1482 = 0.5068).
+  return round(c.energyRmPerKwh + c.capacityRmPerKwh + c.networkRmPerKwh, 4);
+}
+
+/**
+ * Avoided-cost rate for SMP-spread value leak.
+ * LV: full volumetric stack. MV: energy charge only (capacity/network are demand charges).
+ */
+export function avoidedCostRmPerKwh(
+  site: AtapSiteInput,
+  A: Assumptions,
+): { rate: number; label: string } {
+  const category = site.tariffCategory ?? "lv_general";
+  if (category === "mv_general") {
+    return {
+      rate: site.tariffRmPerKwh,
+      label: `MV energy charge RM ${site.tariffRmPerKwh}/kWh (capacity/network are RM/kW demand charges, not volumetric)`,
+    };
+  }
+  const stack = lvVolumetricStackRmPerKwh(A);
+  const c = A.lvVolumetricComponents;
+  return {
+    rate: stack,
+    label:
+      `LV volumetric stack RM ${stack}/kWh ` +
+      `(energy ${c.energyRmPerKwh} + capacity ${c.capacityRmPerKwh} + network ${c.networkRmPerKwh})`,
+  };
+}
+
+/**
+ * Compute the ATAP credit-clock for one site and billing period.
+ * All RM rounded to 2 dp; all kWh rounded to 2 dp on output.
+ */
+export function computeAtapCreditClock(input: AtapCreditClockInput): AtapCreditClockResult {
+  const { site, observations, asOfDate, averageSmp, assumptions: A, expectedKwhByTimestamp } =
+    input;
+  const { periodStart, periodEnd, daysInPeriod } = billingPeriodBounds(asOfDate);
+  const daysRemaining = calendarDaysBetween(asOfDate, periodEnd);
+
+  // --- Eligibility (hard cap from config; kWp used as kWac proxy) ---
+  const cap = A.atap.nonDomesticCapKwac;
+  const capLabel = cap.toLocaleString("en-US");
+  const eligible = site.capacityKwp <= cap;
+  const eligibility: AtapEligibility = eligible
+    ? { eligible: true, reason: null }
+    : {
+        eligible: false,
+        reason: `exceeds ${capLabel} kWac non-domestic cap, GP/ST/No.60/2025`,
+      };
+
+  // --- Observed days: any of load / import / export non-null ---
+  const observedDaySet = new Set<string>();
+  for (const o of observations) {
+    if (o.loadKwh != null || o.importKwh != null || o.exportKwh != null) {
+      observedDaySet.add(dateKey(o.timestamp));
+    }
+  }
+  const observedDays = observedDaySet.size;
+
+  // Sums draw only from rows belonging to counted days (no uncounted-day inflation).
+  const countedRows = observations.filter((o) => observedDaySet.has(dateKey(o.timestamp)));
+  const generationKwhRaw = sumNullable(countedRows.map((o) => o.generationKwh));
+  const loadKwhRaw = sumNullable(countedRows.map((o) => o.loadKwh));
+  const importKwhRaw = sumNullable(countedRows.map((o) => o.importKwh));
+  const exportKwhRaw = sumNullable(countedRows.map((o) => o.exportKwh));
+
+  // Daylight-concurrent import: counted-day rows where expected generation > 0
+  // (same predicate as green-report measurable-interval coverage — NOT generation > 0).
+  let observedDaylightImportKwhRaw = 0;
+  for (const o of countedRows) {
+    if (expectedAt(expectedKwhByTimestamp, o.timestamp) > 0 && o.importKwh != null) {
+      observedDaylightImportKwhRaw += o.importKwh;
+    }
+  }
+
+  const generationKwh = round(generationKwhRaw);
+  const loadKwh = round(loadKwhRaw);
+  const importKwh = round(importKwhRaw);
+  const exportKwh = round(exportKwhRaw);
+  // self-consumption ratio: raw/raw then round at output (never round-then-divide).
+  const selfConsumedKwhRaw = generationKwhRaw - exportKwhRaw;
+  const selfConsumedKwh = round(selfConsumedKwhRaw);
+  const selfConsumptionRatio =
+    generationKwhRaw === 0 ? null : round(selfConsumedKwhRaw / generationKwhRaw, 4);
+
+  // MAQ = capacity (kWac proxy) × sun-hours × days in Billing Period (gazette §2).
+  const maqKwh = round(site.capacityKwp * A.atap.sunHoursPerDay * daysInPeriod);
+
+  const avoided = avoidedCostRmPerKwh(site, A);
+
+  const statedAssumptions: string[] = [
+    A.atap.kwpAsKwacProxy
+      ? "capacity kWp used as kWac proxy (site capacity fields are kWp, not measured kWac)"
+      : "capacity treated as kWac",
+    `Average SMP for preceding month ${averageSmp.monthLabel}: RM ${averageSmp.rmPerKwh}/kWh (${averageSmp.provenance}; ${averageSmp.source})`,
+    `retail energy tariff RM ${site.tariffRmPerKwh}/kWh (energy charge only for net bill; site override or config retailTariffRmPerKwh)`,
+    `smpSpreadRm avoided-cost rate: ${avoided.label}`,
+    "AFA (Automatic Fuel Adjustment) excluded — credits cannot offset AFA (GP/ST/No.60/2025)",
+    `MAQ = ${site.capacityKwp} kWp × ${A.atap.sunHoursPerDay} sun-hours × ${daysInPeriod} days = ${maqKwh} kWh (gazette §2)`,
+    "unused ATAP offset credit is forfeited at billing-period end (clause 3.6.1(b); no carry-forward)",
+  ];
+
+  const coverage: AtapCoverage = {
+    periodStart,
+    periodEnd,
+    daysInPeriod,
+    observedDays,
+    asOfDate,
+    daysRemaining,
+  };
+
+  const observedToDate: AtapObservedToDate = {
+    generationKwh,
+    loadKwh,
+    importKwh,
+    exportKwh,
+    selfConsumedKwh,
+    selfConsumptionRatio,
+  };
+
+  // Ineligible sites: no financial projections (gazette eligibility hard cap).
+  if (!eligible) {
+    statedAssumptions.push(
+      `ineligible: capacity ${site.capacityKwp} kWp exceeds non-domestic hard cap ${capLabel} kWac`,
+    );
+    return {
+      eligibility,
+      coverage,
+      observedToDate,
+      maqKwh,
+      projection: null,
+      valueLeak: null,
+      projectionUnavailableReason: null,
+      assumptions: statedAssumptions,
+    };
+  }
+
+  // Zero coverage: no all-zero pseudo-projection (mirror eligibility-null pattern).
+  if (observedDays === 0) {
+    statedAssumptions.push("projection unavailable: insufficient_data (observedDays = 0)");
+    return {
+      eligibility,
+      coverage,
+      observedToDate,
+      maqKwh,
+      projection: null,
+      valueLeak: null,
+      projectionUnavailableReason: "insufficient_data",
+      assumptions: statedAssumptions,
+    };
+  }
+
+  // --- Full-period linear projection from observed daily means ---
+  statedAssumptions.push(
+    `projection method: linear_daily_mean over ${observedDays} observed day(s) × ${daysInPeriod} days in period`,
+  );
+
+  const dailyMeanExport = exportKwhRaw / observedDays;
+  const dailyMeanImport = importKwhRaw / observedDays;
+  const projectedExport = dailyMeanExport * daysInPeriod;
+  const projectedImport = dailyMeanImport * daysInPeriod;
+  const projectedDaylightImportKwhRaw =
+    (observedDaylightImportKwhRaw / observedDays) * daysInPeriod;
+
+  // offsettable = min(export, import, MAQ); remainder of export is forfeited (clause d).
+  const offsettableExportKwhRaw = Math.min(projectedExport, projectedImport, maqKwh);
+  const forfeitedExportKwhRaw = Math.max(0, projectedExport - offsettableExportKwhRaw);
+
+  // Honest recoverable bound: only daylight-concurrent import can absorb export
+  // via load scheduling (no storage / overnight shift in the product pitch).
+  const loadShiftableExportKwhRaw = Math.min(
+    offsettableExportKwhRaw,
+    projectedDaylightImportKwhRaw,
+  );
+
+  const creditRmRaw = offsettableExportKwhRaw * averageSmp.rmPerKwh;
+  const forfeitedCreditRmRaw = forfeitedExportKwhRaw * averageSmp.rmPerKwh;
+  const energyChargeRmRaw = projectedImport * site.tariffRmPerKwh;
+  // Net floored at zero — clause (e); track credit lost above the bill.
+  const preFloorNetRaw = energyChargeRmRaw - creditRmRaw;
+  const flooredCreditLostRmRaw = preFloorNetRaw < 0 ? -preFloorNetRaw : 0;
+  const netEnergyChargeRmRaw = Math.max(0, preFloorNetRaw);
+
+  // Value leak: headline spread on load-shiftable export; ceiling on full offsettable.
+  const spreadRate = avoided.rate - averageSmp.rmPerKwh;
+  const smpSpreadRmRaw = loadShiftableExportKwhRaw * spreadRate;
+  const smpSpreadCeilingRmRaw = offsettableExportKwhRaw * spreadRate;
+  const totalLeakRaw = smpSpreadRmRaw + forfeitedCreditRmRaw + flooredCreditLostRmRaw;
+
+  const observedDaylightImportKwh = round(observedDaylightImportKwhRaw);
+  const projectedDaylightImportKwh = round(projectedDaylightImportKwhRaw);
+  const loadShiftableExportKwh = round(loadShiftableExportKwhRaw);
+  const smpSpreadCeilingRm = round(smpSpreadCeilingRmRaw);
+
+  statedAssumptions.push(
+    `smp_spread_rm bounded by projected daylight-concurrent import (${projectedDaylightImportKwh} kWh/month) — recoverable by load scheduling within production hours; no storage assumed`,
+    `smp_spread_ceiling_rm (RM ${smpSpreadCeilingRm}) assumes ALL offsettable export could be self-consumed — requires storage or overnight load shifting, NOT achievable by scheduling alone`,
+    "daylight-concurrent = intervals with expected generation > 0 (same predicate as green-report measurable-interval coverage)",
+  );
+
+  const projection: AtapProjection = {
+    method: "linear_daily_mean",
+    observedDays,
+    exportKwh: round(projectedExport),
+    importKwh: round(projectedImport),
+    offsettableExportKwh: round(offsettableExportKwhRaw),
+    forfeitedExportKwh: round(forfeitedExportKwhRaw),
+    creditRm: round(creditRmRaw),
+    forfeitedCreditRm: round(forfeitedCreditRmRaw),
+    energyChargeRm: round(energyChargeRmRaw),
+    netEnergyChargeRm: round(netEnergyChargeRmRaw),
+    observedDaylightImportKwh,
+    projectedDaylightImportKwh,
+    loadShiftableExportKwh,
+  };
+
+  const valueLeak: AtapValueLeak = {
+    smpSpreadRm: round(smpSpreadRmRaw),
+    smpSpreadCeilingRm,
+    forfeitedCreditRm: round(forfeitedCreditRmRaw),
+    flooredCreditLostRm: round(flooredCreditLostRmRaw),
+    totalRm: round(totalLeakRaw),
+  };
+
+  return {
+    eligibility,
+    coverage,
+    observedToDate,
+    maqKwh,
+    projection,
+    valueLeak,
+    projectionUnavailableReason: null,
+    assumptions: statedAssumptions,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Realized (closed-period) value — no projection; observed actuals only (I6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Input for realized ATAP value over a CLOSED billing period.
+ * Same site / SMP / assumptions / expected map as computeAtapCreditClock;
+ * observations should cover the full period (or whatever was recorded —
+ * partial coverage is allowed and disclosed via coverage fields).
+ */
+export type AtapRealizedValueInput = {
+  site: AtapSiteInput;
+  /** Observations scoped to the closed billing period (period_start…period_end). */
+  observations: Observation[];
+  /** Any date in the closed period (used only for billingPeriodBounds). */
+  periodDate: string;
+  averageSmp: AtapAverageSmp;
+  assumptions: Assumptions;
+  expectedKwhByTimestamp: Record<string, number> | Map<string, number>;
+};
+
+/**
+ * Realized load-shift opportunity on a closed period's actuals.
+ * Same settlement formulas as the projection path, WITHOUT the linear_daily_mean
+ * scale-up: uses observed export/import/daylight-import only.
+ *
+ * - offsettableExport = min(export, import, MAQ)  (clause d)
+ * - loadShiftableExport = min(offsettableExport, daylightImport)  (no storage)
+ * - smpSpreadRm = loadShiftableExport × (avoidedCost − Average SMP)
+ */
+export interface AtapRealizedValue {
+  periodStart: string;
+  periodEnd: string;
+  daysInPeriod: number;
+  observedDays: number;
+  exportKwh: number;
+  importKwh: number;
+  daylightImportKwh: number;
+  loadShiftableExportKwh: number;
+  smpSpreadRm: number;
+  assumptions: string[];
+}
+
+/**
+ * Realized-value computation for a closed billing period (I6 / B1).
+ * Deterministic, no LLM. Citations match computeAtapCreditClock.
+ *
+ * Partial observation coverage is handled honestly: grades use whatever
+ * observations were recorded; callers must surface observedDays / daysInPeriod
+ * as a coverage caveat (no silent annualisation).
+ */
+export function computeAtapRealizedValue(input: AtapRealizedValueInput): AtapRealizedValue {
+  const { site, observations, periodDate, averageSmp, assumptions: A, expectedKwhByTimestamp } =
+    input;
+  const { periodStart, periodEnd, daysInPeriod } = billingPeriodBounds(periodDate);
+
+  // Observed days: any of load / import / export non-null (same predicate as clock).
+  const observedDaySet = new Set<string>();
+  for (const o of observations) {
+    if (o.loadKwh != null || o.importKwh != null || o.exportKwh != null) {
+      observedDaySet.add(dateKey(o.timestamp));
+    }
+  }
+  const observedDays = observedDaySet.size;
+  const countedRows = observations.filter((o) => observedDaySet.has(dateKey(o.timestamp)));
+
+  const importKwhRaw = sumNullable(countedRows.map((o) => o.importKwh));
+  const exportKwhRaw = sumNullable(countedRows.map((o) => o.exportKwh));
+
+  let daylightImportKwhRaw = 0;
+  for (const o of countedRows) {
+    if (expectedAt(expectedKwhByTimestamp, o.timestamp) > 0 && o.importKwh != null) {
+      daylightImportKwhRaw += o.importKwh;
+    }
+  }
+
+  // MAQ for the full period (gazette §2) — even when coverage is partial, MAQ is calendar-based.
+  const maqKwh = site.capacityKwp * A.atap.sunHoursPerDay * daysInPeriod;
+
+  // Same trim as projection path, on observed (not projected) totals.
+  const offsettableExportKwhRaw = Math.min(exportKwhRaw, importKwhRaw, maqKwh);
+  const loadShiftableExportKwhRaw = Math.min(offsettableExportKwhRaw, daylightImportKwhRaw);
+
+  const avoided = avoidedCostRmPerKwh(site, A);
+  const spreadRate = avoided.rate - averageSmp.rmPerKwh;
+  const smpSpreadRmRaw = loadShiftableExportKwhRaw * spreadRate;
+
+  const exportKwh = round(exportKwhRaw);
+  const importKwh = round(importKwhRaw);
+  const daylightImportKwh = round(daylightImportKwhRaw);
+  const loadShiftableExportKwh = round(loadShiftableExportKwhRaw);
+  const smpSpreadRm = round(smpSpreadRmRaw);
+
+  const coverageRatio = daysInPeriod > 0 ? observedDays / daysInPeriod : 0;
+  const statedAssumptions: string[] = [
+    "realized path: observed actuals only — no linear_daily_mean projection",
+    A.atap.kwpAsKwacProxy
+      ? "capacity kWp used as kWac proxy (site capacity fields are kWp, not measured kWac)"
+      : "capacity treated as kWac",
+    `Average SMP for preceding month ${averageSmp.monthLabel}: RM ${averageSmp.rmPerKwh}/kWh (${averageSmp.provenance}; ${averageSmp.source})`,
+    `smpSpreadRm avoided-cost rate: ${avoided.label}`,
+    `MAQ = ${site.capacityKwp} kWp × ${A.atap.sunHoursPerDay} sun-hours × ${daysInPeriod} days = ${round(maqKwh)} kWh (gazette §2)`,
+    `coverage: ${observedDays}/${daysInPeriod} days observed (${round(coverageRatio * 100, 1)}%) — partial coverage grades on recorded actuals only, no annualisation`,
+    "offsettableExport = min(export, import, MAQ); loadShiftableExport = min(offsettable, daylightImport); smpSpread = loadShiftable × (avoided − SMP)",
+    "daylight-concurrent = intervals with expected generation > 0 (same predicate as green-report measurable-interval coverage)",
+  ];
+
+  return {
+    periodStart,
+    periodEnd,
+    daysInPeriod,
+    observedDays,
+    exportKwh,
+    importKwh,
+    daylightImportKwh,
+    loadShiftableExportKwh,
+    smpSpreadRm,
+    assumptions: statedAssumptions,
+  };
+}

@@ -6,4 +6,13 @@
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "assets": { "directory": ".open-next/assets", "binding": "ASSETS" },
   "services": [{ "binding": "WORKER_SELF_REFERENCE", "service": "solarpulse" }]
+  // KREDIT action ledger (D1). Created 2026-07-28 via `wrangler d1 create kredit-ledger`.
+  , "d1_databases": [
+    {
+      "binding": "KREDIT_LEDGER",
+      "database_name": "kredit-ledger",
+      "database_id": "4d9cadbd-0590-4711-9039-051c5adb0fb2",
+      "migrations_dir": "migrations"
+    }
+  ]
 }

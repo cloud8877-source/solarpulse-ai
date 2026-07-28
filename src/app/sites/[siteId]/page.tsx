@@ -1,8 +1,10 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { CopilotPanel } from "@/app/components/CopilotPanel";
+import { CreditClockPanel } from "@/app/components/CreditClockPanel";
 import { ForecastChart } from "@/app/components/ForecastChart";
 import { ReportPanel } from "@/app/components/ReportPanel";
+import { WeatherBadge } from "@/app/components/WeatherBadge";
 import { StatusBadge, fmtInt, fmtPct } from "@/app/components/ui";
 import { SolarOpsError, solarOps } from "@/services/solarops";
 
@@ -12,8 +14,16 @@ export default async function SiteDetail({ params }: { params: Promise<{ siteId:
   const { siteId } = await params;
 
   let detail: ReturnType<ReturnType<typeof solarOps>["siteDetail"]>;
+  let clock: ReturnType<ReturnType<typeof solarOps>["atapCreditClock"]> | null = null;
   try {
-    detail = solarOps().siteDetail(siteId);
+    const ops = solarOps();
+    detail = ops.siteDetail(siteId);
+    try {
+      clock = ops.atapCreditClock(siteId);
+    } catch {
+      // SMP missing or other ATAP path failure — panel omitted, page still renders.
+      clock = null;
+    }
   } catch (e) {
     if (e instanceof SolarOpsError) notFound();
     throw e;
@@ -33,8 +43,9 @@ export default async function SiteDetail({ params }: { params: Promise<{ siteId:
         <h1 style={{ display: "flex", alignItems: "center", gap: 12 }}>
           {site.name} <StatusBadge status={site.latest_status} />
         </h1>
-        <span className="muted" style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <span className="muted" style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           {site.region} · {fmtInt(site.capacity_kwp)} kWp
+          <WeatherBadge siteId={site.site_id} />
           <Link href={`/sites/${site.site_id}/green-report`}>Green Performance Report →</Link>
         </span>
       </div>
@@ -95,6 +106,12 @@ export default async function SiteDetail({ params }: { params: Promise<{ siteId:
           </div>
         </div>
       </div>
+
+      {clock ? (
+        <div style={{ marginTop: 16 }}>
+          <CreditClockPanel clock={clock} />
+        </div>
+      ) : null}
 
       <div className="card" style={{ marginTop: 16, padding: 0, overflow: "hidden" }}>
         <div style={{ padding: "16px 20px 4px" }}>

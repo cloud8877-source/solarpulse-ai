@@ -89,8 +89,18 @@ export const detectAssetUnderperformanceTool = tool({
     "Deterministically compare observed vs expected generation over a window and return residual, severity, evidence, and an anomaly_event_id. Data-quality issues short-circuit to severity=data_issue (do not diagnose equipment on bad telemetry).",
   inputSchema: z.object({
     site_id: z.string(),
-    window_start: z.string().optional(),
-    window_end: z.string().optional(),
+    window_start: z
+      .string()
+      .optional()
+      .describe(
+        "Window start (ISO timestamp or YYYY-MM-DD). Detection windows are day-granular: the bound is converted to local (+08:00) and expanded to 00:00:00 of that calendar day. UTC/Z inputs are converted (e.g. 2026-06-19T20:00:00Z → 2026-06-20 in +08). Alone, scopes to that single local day.",
+      ),
+    window_end: z
+      .string()
+      .optional()
+      .describe(
+        "Window end (ISO timestamp or YYYY-MM-DD). Converted to local (+08:00) and expanded to 23:59:59.999 of that calendar day. Alone, scopes to that single local day. With window_start, multi-day windows are allowed (event id anom_<site>_<startday>_<endday>).",
+      ),
   }),
   outputSchema: z.object({
     anomaly_event_id: z.string(),
@@ -168,4 +178,6 @@ export const solaropsTools = {
   explain_solar_anomaly: explainSolarAnomalyTool,
   rank_om_actions: rankOmActionsTool,
   generate_solar_report: generateSolarReportTool,
+  // I6: no verify tool — grades are permanent engine-derived; model cannot author
+  // outcome/measuredRm. If a future increment exposes one, schema must exclude those fields.
 };

@@ -22,9 +22,15 @@ describe("Green Performance Report (GPR)", () => {
     expect(rep.content).toContain(
       "| Performance index (observed / expected) | **100.2%** |",
     );
-    // Literal financial / carbon figures (must catch a broken calculation).
-    expect(rep.content).toContain("**RM 2329.57**");
-    expect(rep.content).toContain("**3028.44 kg CO₂e**");
+    // F3 ATAP-eligible valuation: selfConsumed × LV stack + export × SMP
+    // day-4 site_a: selfConsumed 1520 kWh × 0.5068 = 770.336 → 770.34 (avoided cost)
+    //               exported 3139.14 kWh × 0.1893 = 594.239202 → 594.24 (export credit)
+    //               total = 770.34 + 594.24 = 1364.58
+    expect(rep.content).toContain("**RM 1364.58**");
+    expect(rep.content).toContain("avoided cost");
+    expect(rep.content).toContain("export credit");
+    // 4659.14 kWh × 0.652 kgCO₂e/kWh = 3037.75928 → 3037.76
+    expect(rep.content).toContain("**3037.76 kg CO₂e**");
     expect(rep.content).toContain("Assumptions");
     expect(rep.content).toContain("| Name | Value | Note |");
     expect(rep.content).toContain("fixture_data");
@@ -35,12 +41,15 @@ describe("Green Performance Report (GPR)", () => {
     expect(rep.data.production.observedKwh).toBe(4659.14);
     expect(rep.data.production.expectedKwh).toBe(4651.61);
     expect(rep.data.production.performanceIndexDisplay).toBe("100.2%");
-    expect(rep.data.value.rmValue).toBe(2329.57);
-    expect(rep.data.value.co2Kg).toBe(3028.44);
+    expect(rep.data.value.rmValue).toBe(1364.58);
+    expect(rep.data.value.valuationMode).toBe("atap_stack");
+    expect(rep.data.value.avoidedCostRm).toBe(770.34); // 1520 × 0.5068
+    expect(rep.data.value.exportCreditRm).toBe(594.24); // 3139.14 × 0.1893
+    expect(rep.data.value.co2Kg).toBe(3037.76); // 4659.14 kWh × 0.652
     expect(rep.data.incidents.severity).toBe("healthy");
   });
 
-  it("site_b (anomalous) mentions the anomaly and its likely cause", () => {
+  it("site_b (anomalous, ATAP-ineligible) keeps single-rate valuation and mentions anomaly", () => {
     const rep = svc().generateGreenPerformanceReport("site_b", FIXED_NOW);
 
     expect(rep.content).toMatch(/\*\*Status:\*\* anomaly/);
@@ -50,16 +59,20 @@ describe("Green Performance Report (GPR)", () => {
     expect(rep.data.incidents.severity).toBe("anomaly");
     expect(rep.data.incidents.causePlain).toBe("inverter or string underperformance");
     expect(rep.data.incidents.evidence.length).toBeGreaterThan(0);
+    // Ineligible → single-rate (site tariff 0.2983), not stack+SMP.
+    expect(rep.data.value.valuationMode).toBe("single_rate");
+    expect(rep.content).toContain("tariff assumption");
   });
 
-  it("site_c (data_issue) states interval coverage, evidence lines, and does not present period totals", () => {
+  it("site_c (data_issue) states measurable-interval coverage, evidence lines, and does not present period totals", () => {
     const rep = svc().generateGreenPerformanceReport("site_c", FIXED_NOW);
 
     expect(rep.content).toMatch(/\*\*Status:\*\* data_issue/);
     expect(rep.data.incidents.severity).toBe("data_issue");
-    // Interval coverage caveat next to observed figure (8 of 11 valid intervals).
-    expect(rep.content).toContain("based on 8 of 11 valid intervals");
-    expect(rep.data.production.coverageNote).toBe("based on 8 of 11 valid intervals");
+    // F15: denominator = intervals with expected generation > 0 (daylight ~11),
+    // not the full 24h window. 4 missing daylight → 7 of ~11 measurable.
+    expect(rep.content).toContain("based on 7 of ~11 measurable intervals");
+    expect(rep.data.production.coverageNote).toBe("based on 7 of ~11 measurable intervals");
     // Evidence lines from root cause (symmetric with anomalous branch).
     expect(rep.content).toContain("Evidence:");
     expect(rep.data.incidents.evidence.length).toBeGreaterThan(0);

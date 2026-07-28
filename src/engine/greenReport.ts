@@ -13,6 +13,7 @@ import type {
   Site,
   SourceManifest,
 } from "../domain/types";
+import { lvVolumetricStackRmPerKwh } from "./atap";
 import { round } from "./math";
 import { renderManifest } from "./report";
 
@@ -29,12 +30,25 @@ function plainCause(cause: LikelyCause): string {
   return CAUSE_PLAIN[cause];
 }
 
-/** Coverage caveat for valid-interval-only sums (never present as full-period totals). */
-function coverageNote(anomaly: AnomalyResult): string | undefined {
-  if (anomaly.severity !== "data_issue") return undefined;
-  const valid = anomaly.evidence.validIntervals;
-  const total = anomaly.evidence.validIntervals + anomaly.evidence.missingIntervals;
-  return `based on ${valid} of ${total} valid intervals`;
+/**
+ * Coverage caveat for data_issue: denominator is measurable intervals
+ * (expected generation > 0, i.e. daylight), not the full 24h window.
+ */
+function coverageNote(args: {
+  anomaly: AnomalyResult;
+  validMeasurableIntervals?: number;
+  measurableIntervals?: number;
+}): string | undefined {
+  if (args.anomaly.severity !== "data_issue") return undefined;
+  const measurable = args.measurableIntervals;
+  const valid = args.validMeasurableIntervals;
+  if (measurable != null && measurable > 0 && valid != null) {
+    return `based on ${valid} of ~${measurable} measurable intervals`;
+  }
+  // Fallback: all-interval counts (legacy path if service did not pass measurable).
+  const validAll = args.anomaly.evidence.validIntervals;
+  const total = args.anomaly.evidence.validIntervals + args.anomaly.evidence.missingIntervals;
+  return `based on ${validAll} of ${total} valid intervals`;
 }
 
 function productionSentence(args: {
@@ -104,10 +118,22 @@ export interface GreenReportData {
     footerNote?: string;
   };
   value: {
+    /** Total energy value RM (avoided cost + export credit for ATAP-eligible; single-rate otherwise). */
     rmValue: number;
+    /** Single-rate tariff for ineligible sites; energy charge for eligible bill context. */
     tariffRmPerKwh: number;
     co2Kg: number;
     carbonFactor: number;
+    /** Present when ATAP-eligible valuation is used. */
+    valuationMode?: "atap_stack" | "single_rate";
+    selfConsumedKwh?: number;
+    exportedKwh?: number;
+    /** Self-consumed × full LV volumetric stack (avoided cost). */
+    avoidedCostRm?: number;
+    /** Exported × Average SMP (export credit). */
+    exportCreditRm?: number;
+    volumetricStackRmPerKwh?: number;
+    averageSmpRmPerKwh?: number;
   };
   manifest: SourceManifest;
   modelVersion: string;
@@ -122,6 +148,18 @@ export interface GreenReportArgs {
   reportId: string;
   anomalyEventId?: string | null;
   now?: string;
+  /** ATAP eligibility for the site (passed in — engine stays pure). */
+  atapEligible?: boolean;
+  /** Average SMP RM/kWh for export-credit valuation (ATAP-eligible path). */
+  averageSmpRmPerKwh?: number;
+  /** Period self-consumed kWh (generation − export) for ATAP stack valuation. */
+  selfConsumedKwh?: number;
+  /** Period exported kWh for ATAP stack valuation. */
+  exportedKwh?: number;
+  /** Intervals with expected generation > 0 (daylight measurable denominator). */
+  measurableIntervals?: number;
+  /** Of measurable intervals, how many have non-null generation. */
+  validMeasurableIntervals?: number;
 }
 
 export interface GreenReportResult {
@@ -134,6 +172,7 @@ function resolvedManifest(
   tariff: number,
   carbon: number,
   performanceRatio: number,
+  extra: Array<{ name: string; value: number | string; note?: string }> = [],
 ): SourceManifest {
   return {
     ...base,
@@ -153,6 +192,7 @@ function resolvedManifest(
         value: performanceRatio,
         note: "Baseline performance ratio; per-site value used where available.",
       },
+      ...extra,
     ],
   };
 }
@@ -193,6 +233,26 @@ function buildIncidentsBody(data: GreenReportData["incidents"]): string {
   ].join("\n");
 }
 
+function renderValueSection(v: GreenReportData["value"]): string {
+  if (v.valuationMode === "atap_stack") {
+    return [
+      `Energy value of observed production: **RM ${v.rmValue}** ` +
+        `(avoided cost of self-consumed kWh at full LV volumetric stack RM ${v.volumetricStackRmPerKwh}/kWh ` +
+        `+ export credit at Average SMP RM ${v.averageSmpRmPerKwh}/kWh).  `,
+      `- Avoided cost (self-consumed **${v.selfConsumedKwh} kWh** × RM ${v.volumetricStackRmPerKwh}/kWh): **RM ${v.avoidedCostRm}**  `,
+      `- Export credit (exported **${v.exportedKwh} kWh** × RM ${v.averageSmpRmPerKwh}/kWh): **RM ${v.exportCreditRm}**  `,
+      `CO₂ avoided from observed production: **${v.co2Kg} kg CO₂e** ` +
+        `(at ${v.carbonFactor} kgCO₂e/kWh carbon factor).`,
+    ].join("\n");
+  }
+  return (
+    `Energy value of observed production: **RM ${v.rmValue}** ` +
+    `(at RM ${v.tariffRmPerKwh}/kWh tariff assumption).  \n` +
+    `CO₂ avoided from observed production: **${v.co2Kg} kg CO₂e** ` +
+    `(at ${v.carbonFactor} kgCO₂e/kWh carbon factor).`
+  );
+}
+
 function renderMarkdown(data: GreenReportData): string {
   const { production: p, value: v } = data;
   const observedCell = p.coverageNote
@@ -224,10 +284,7 @@ function renderMarkdown(data: GreenReportData): string {
     "",
     "## Value & Sustainability",
     "",
-    `Energy value of observed production: **RM ${v.rmValue}** ` +
-      `(at RM ${v.tariffRmPerKwh}/kWh tariff assumption).  `,
-    `CO₂ avoided from observed production: **${v.co2Kg} kg CO₂e** ` +
-      `(at ${v.carbonFactor} kgCO₂e/kWh carbon factor).`,
+    renderValueSection(v),
     "",
     "## Assumptions & Source Provenance",
     "",
@@ -253,13 +310,78 @@ export function generateGreenReport(args: GreenReportArgs): GreenReportResult {
     : "n/a";
 
   // Resolve per-site overrides (same values used in body and provenance manifest).
-  const tariff = site.tariffAssumptionRmPerKwh ?? A.tariffRmPerKwh;
+  const tariff = site.tariffAssumptionRmPerKwh ?? A.retailTariffRmPerKwh;
   const carbon = site.carbonFactorKgco2PerKwh ?? A.carbonFactorKgco2PerKwh;
-  const energyValueRm = round(observedKwh * tariff);
   const co2AvoidedKg = round(observedKwh * carbon);
-  const manifest = resolvedManifest(args.manifest, tariff, carbon, site.performanceRatio);
 
-  const coverage = coverageNote(anomaly);
+  const atapEligible = args.atapEligible === true;
+  const stack = lvVolumetricStackRmPerKwh(A);
+  const smp = args.averageSmpRmPerKwh;
+  const selfConsumed = args.selfConsumedKwh;
+  const exported = args.exportedKwh;
+
+  let energyValueRm: number;
+  let valueFields: GreenReportData["value"];
+  const extraManifest: Array<{ name: string; value: number | string; note?: string }> = [];
+
+  if (
+    atapEligible &&
+    smp != null &&
+    selfConsumed != null &&
+    exported != null
+  ) {
+    const avoidedCostRm = round(selfConsumed * stack);
+    const exportCreditRm = round(exported * smp);
+    energyValueRm = round(avoidedCostRm + exportCreditRm);
+    valueFields = {
+      rmValue: energyValueRm,
+      tariffRmPerKwh: tariff,
+      co2Kg: co2AvoidedKg,
+      carbonFactor: carbon,
+      valuationMode: "atap_stack",
+      selfConsumedKwh: round(selfConsumed),
+      exportedKwh: round(exported),
+      avoidedCostRm,
+      exportCreditRm,
+      volumetricStackRmPerKwh: stack,
+      averageSmpRmPerKwh: smp,
+    };
+    extraManifest.push(
+      {
+        name: "lv_volumetric_stack_rm_per_kwh",
+        value: stack,
+        note: "Full LV avoided-cost stack (energy + capacity + network) for self-consumed kWh.",
+      },
+      {
+        name: "average_smp_rm_per_kwh",
+        value: smp,
+        note: "Average SMP applied to exported kWh (export credit).",
+      },
+    );
+  } else {
+    energyValueRm = round(observedKwh * tariff);
+    valueFields = {
+      rmValue: energyValueRm,
+      tariffRmPerKwh: tariff,
+      co2Kg: co2AvoidedKg,
+      carbonFactor: carbon,
+      valuationMode: "single_rate",
+    };
+  }
+
+  const manifest = resolvedManifest(
+    args.manifest,
+    tariff,
+    carbon,
+    site.performanceRatio,
+    extraManifest,
+  );
+
+  const coverage = coverageNote({
+    anomaly,
+    measurableIntervals: args.measurableIntervals,
+    validMeasurableIntervals: args.validMeasurableIntervals,
+  });
   const sentence = productionSentence({
     siteName: site.name,
     observedKwh,
@@ -321,12 +443,7 @@ export function generateGreenReport(args: GreenReportArgs): GreenReportResult {
       ...(coverage ? { coverageNote: coverage } : {}),
     },
     incidents,
-    value: {
-      rmValue: energyValueRm,
-      tariffRmPerKwh: tariff,
-      co2Kg: co2AvoidedKg,
-      carbonFactor: carbon,
-    },
+    value: valueFields,
     manifest,
     modelVersion: MODEL_VERSION,
     caveats,

@@ -103,6 +103,62 @@ td.num, th.num { text-align: right; }
 .badge.tag { color: var(--text-dim); background: var(--surface-2); border-color: var(--border); }
 .badge.tag::before { display: none; }
 
+/* KREDIT action status chips */
+.badge.action-awaiting { color: var(--amber); background: rgba(251, 191, 36, 0.12); border-color: rgba(251, 191, 36, 0.35); }
+.badge.action-issued { color: var(--green); background: rgba(52, 211, 153, 0.12); border-color: rgba(52, 211, 153, 0.35); }
+.badge.action-blocked { color: var(--red); background: rgba(248, 113, 113, 0.12); border-color: rgba(248, 113, 113, 0.35); }
+.badge.action-expired { color: var(--text-faint); background: var(--surface-2); border-color: var(--border); }
+.badge.action-verified {
+  color: var(--green); background: transparent;
+  border-color: rgba(52, 211, 153, 0.55);
+}
+.badge.action-falsified {
+  color: var(--red); background: transparent;
+  border-color: rgba(248, 113, 113, 0.55);
+}
+.badge.seed-fixture {
+  color: #c4b5fd; background: rgba(167, 139, 250, 0.12);
+  border-color: rgba(167, 139, 250, 0.4);
+  letter-spacing: 0.04em;
+}
+.badge.seed-fixture::before { display: none; }
+.badge.weather-live {
+  color: var(--accent); background: rgba(45, 212, 191, 0.1);
+  border-color: rgba(45, 212, 191, 0.35);
+  font-weight: 600;
+}
+.badge.weather-live::before { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+.badge.weather-badge { max-width: 100%; white-space: normal; line-height: 1.3; }
+
+/* Ops feed */
+.sweep-card-head,
+.action-row-head {
+  display: flex; width: 100%; align-items: flex-start; justify-content: space-between; gap: 12px;
+  padding: 14px 16px; background: transparent; border: none; color: inherit;
+  font: inherit; text-align: left; cursor: pointer;
+}
+.sweep-card-head:hover,
+.action-row-head:hover { background: var(--surface-2); }
+.action-row { border-top: 1px solid var(--border); }
+.action-evidence { padding: 4px 16px 16px; border-top: 1px dashed var(--border); }
+.approval-card {
+  padding: 12px 14px; border-radius: var(--radius-sm);
+  background: rgba(251, 191, 36, 0.06); border: 1px solid rgba(251, 191, 36, 0.25);
+}
+.policy-card {
+  padding: 10px 12px; border-radius: var(--radius-sm);
+  background: var(--surface-2); border: 1px solid var(--border);
+}
+.policy-card.deny {
+  background: rgba(248, 113, 113, 0.08); border-color: rgba(248, 113, 113, 0.35);
+}
+.policy-card.require {
+  background: rgba(251, 191, 36, 0.06); border-color: rgba(251, 191, 36, 0.28);
+}
+.policy-card.allow {
+  background: rgba(52, 211, 153, 0.06); border-color: rgba(52, 211, 153, 0.25);
+}
+
 .confidence { font-size: 0.72rem; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.04em; }
 
 .btn {
