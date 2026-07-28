@@ -55,6 +55,47 @@ describe("SolarOps service layer (PDR-005 contracts)", () => {
     expect(f.quality_flags).toContain("metric_from_reference");
   });
 
+  // F1: reference WAPE must be day-scoped (day-4 ≡ old single-day fixture → 0.0187).
+  it("forecast(site_c) default-path metric is day-scoped reference WAPE 0.0187", () => {
+    const f = svc().forecast("site_c", "day_ahead");
+    expect(f.metric.value).toBeCloseTo(0.0187, 4);
+    expect(f.quality_flags).toContain("metric_from_reference");
+  });
+
+  // F2: lone window_start must not open-end through remaining days.
+  it("lone window_start scopes to that single day (matches asOfDate)", () => {
+    const s = svc();
+    const lone = s.detectAssetUnderperformance("site_b", "2026-06-19T00:00:00+08:00");
+    const day = s.detectAssetUnderperformance("site_b", undefined, undefined, "2026-06-19");
+    expect(lone.observed_kwh).toBe(day.observed_kwh);
+    expect(lone.severity).toBe(day.severity);
+    expect(lone.anomaly_event_id).toBe(day.anomaly_event_id);
+  });
+
+  // F3: weather must be window-scoped (evidence matches full-day explicit window).
+  it("detectEvent asOfDate evidence matches full-day explicit window", () => {
+    const s = svc();
+    const byDate = s.detectAssetUnderperformance("site_b", undefined, undefined, "2026-06-19");
+    const byWindow = s.detectAssetUnderperformance(
+      "site_b",
+      "2026-06-19T00:00:00+08:00",
+      "2026-06-19T23:59:59+08:00",
+    );
+    expect(byDate.evidence).toEqual(byWindow.evidence);
+    expect(byDate.observed_kwh).toBe(byWindow.observed_kwh);
+    expect(byDate.severity).toBe(byWindow.severity);
+  });
+
+  // F4: empty window must not fabricate high-confidence healthy / weather_explained.
+  it("empty asOfDate window is not healthy and not high-confidence weather_explained", () => {
+    const s = svc();
+    const d = s.detectAssetUnderperformance("site_b", undefined, undefined, "2026-01-01");
+    expect(d.severity).not.toBe("healthy");
+    expect(d.severity).toBe("data_issue");
+    const e = s.explainSolarAnomaly(d.anomaly_event_id);
+    expect(e.likely_cause === "weather_explained" && e.confidence === "high").toBe(false);
+  });
+
   it("chained flow detect -> explain -> rank -> report (Site B)", () => {
     const s = svc();
     const d = s.detectAssetUnderperformance("site_b");

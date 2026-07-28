@@ -3,7 +3,7 @@
 // persists anomaly events under deterministic ids, and raises typed errors
 // (PDR-005 §6). No LLM is involved in any calculation here (ADR-0005).
 
-import { assumptions } from "../config/assumptions";
+import { assumptions, MODEL_VERSION } from "../config/assumptions";
 import { buildSourceManifest, FIXTURE_INPUTS } from "../data/sourceManifest";
 import { getStore, type SolarStore } from "../data/store";
 import { detectUnderperformance } from "../engine/anomaly";
@@ -19,6 +19,7 @@ import type {
   GridHorizon,
   Horizon,
   Observation,
+  QualityFlag,
   ReportFormat,
   RootCauseResult,
   Severity,
@@ -78,6 +79,17 @@ function filterByDate<T extends { timestamp: string }>(rows: T[], asOfDate: stri
   return rows.filter((r) => dateKey(r.timestamp) === asOfDate);
 }
 
+/** Inclusive timestamp window filter (ISO strings compare lexicographically for +08:00 fixtures). */
+function filterByWindow<T extends { timestamp: string }>(
+  rows: T[],
+  start?: string,
+  end?: string,
+): T[] {
+  return rows.filter(
+    (r) => (!start || r.timestamp >= start) && (!end || r.timestamp <= end),
+  );
+}
+
 function eventToAnomalyResult(ev: AnomalyEvent): AnomalyResult {
   return {
     siteId: ev.siteId,
@@ -104,7 +116,8 @@ function eventToRootCause(ev: AnomalyEvent): RootCauseResult {
 }
 
 export function createSolarOpsService(store: SolarStore = getStore()) {
-  let referenceWapeCache: number | null | undefined; // undefined = not computed yet
+  // Day-scoped reference WAPE (key = YYYY-MM-DD); value null means unmeasurable that day.
+  const referenceWapeCache = new Map<string, number | null>();
   let latestFixtureDateCache: string | null | undefined;
 
   /** Latest ISO date (YYYY-MM-DD) present in fixture observations; demo default asOfDate. */
@@ -127,14 +140,20 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     return asOfDate ?? latestFixtureDate();
   }
 
-  function referenceWape(): number | undefined {
-    if (referenceWapeCache === undefined) {
+  /** Reference-site fixture WAPE for a single asOfDate day (not cross-day). */
+  function referenceWape(asOfDate?: string): number | undefined {
+    const day = resolveAsOfDate(asOfDate);
+    if (!referenceWapeCache.has(day)) {
       const ref = store.getSite(REFERENCE_SITE_ID);
-      referenceWapeCache = ref
-        ? fixtureWape(store.getObservations(ref.id), expectedProfile(ref, store.getWeather(ref.id)))
-        : null;
+      if (!ref) {
+        referenceWapeCache.set(day, null);
+      } else {
+        const obs = filterByDate(store.getObservations(ref.id), day);
+        const wx = filterByDate(store.getWeather(ref.id), day);
+        referenceWapeCache.set(day, fixtureWape(obs, expectedProfile(ref, wx)));
+      }
     }
-    return referenceWapeCache ?? undefined;
+    return referenceWapeCache.get(day) ?? undefined;
   }
 
   function requireSite(siteId: string) {
@@ -143,34 +162,7 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     return site;
   }
 
-  function detectEvent(
-    siteId: string,
-    windowStart?: string,
-    windowEnd?: string,
-    asOfDate?: string,
-  ): AnomalyEvent {
-    const site = requireSite(siteId);
-    const observations = store.getObservations(siteId);
-    if (observations.length === 0) {
-      throw new SolarOpsError("no_observations", `No telemetry available for site '${siteId}'.`);
-    }
-
-    // Explicit windows win; otherwise scope to asOfDate (default = latest fixture day).
-    let start = windowStart;
-    let end = windowEnd;
-    if (!start && !end) {
-      const bounds = dayWindow(resolveAsOfDate(asOfDate));
-      start = bounds.windowStart;
-      end = bounds.windowEnd;
-    }
-
-    const anomaly = detectUnderperformance({
-      site,
-      observations,
-      weather: store.getWeather(siteId),
-      ...(start ? { windowStart: start } : {}),
-      ...(end ? { windowEnd: end } : {}),
-    });
+  function persistEvent(siteId: string, anomaly: AnomalyResult, site: ReturnType<typeof requireSite>): AnomalyEvent {
     const rootCause = classifyRootCause({ anomaly, site });
     const event: AnomalyEvent = {
       id: anomalyEventId(siteId, anomaly.windowStart),
@@ -193,6 +185,74 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     };
     store.saveAnomalyEvent(event);
     return event;
+  }
+
+  function detectEvent(
+    siteId: string,
+    windowStart?: string,
+    windowEnd?: string,
+    asOfDate?: string,
+  ): AnomalyEvent {
+    const site = requireSite(siteId);
+    const allObservations = store.getObservations(siteId);
+    if (allObservations.length === 0) {
+      throw new SolarOpsError("no_observations", `No telemetry available for site '${siteId}'.`);
+    }
+
+    // Explicit windows win; otherwise scope to asOfDate (default = latest fixture day).
+    // A lone bound always scopes to that single local (+08:00) day — never open-ended.
+    let start = windowStart;
+    let end = windowEnd;
+    if (!start && !end) {
+      const bounds = dayWindow(resolveAsOfDate(asOfDate));
+      start = bounds.windowStart;
+      end = bounds.windowEnd;
+    } else if (start && !end) {
+      end = dayWindow(dateKey(start)).windowEnd;
+    } else if (!start && end) {
+      start = dayWindow(dateKey(end)).windowStart;
+    }
+
+    // Scope observations + weather to the same window before the engine runs
+    // (weatherNormal / weather_unavailable must not mix cross-day means).
+    const observations = filterByWindow(allObservations, start, end);
+    const weather = filterByWindow(store.getWeather(siteId), start, end);
+
+    // Empty window → data_issue (same convention as lookupSolarSite empty day), never "healthy".
+    if (observations.length === 0) {
+      const flags: QualityFlag[] = [];
+      if (site.isFixture) flags.push("fixture_data");
+      const anomaly: AnomalyResult = {
+        siteId,
+        windowStart: start!,
+        windowEnd: end!,
+        observedKwh: 0,
+        expectedKwh: 0,
+        residualKwh: 0,
+        residualPct: 0,
+        severity: "data_issue",
+        qualityFlags: flags,
+        evidence: {
+          weatherNormal: false,
+          persistentIntervals: 0,
+          validIntervals: 0,
+          missingIntervals: 0,
+          noisyIntervals: 0,
+          notes: ["No telemetry in the requested window."],
+        },
+        modelVersion: MODEL_VERSION,
+      };
+      return persistEvent(siteId, anomaly, site);
+    }
+
+    const anomaly = detectUnderperformance({
+      site,
+      observations,
+      weather,
+      ...(start ? { windowStart: start } : {}),
+      ...(end ? { windowEnd: end } : {}),
+    });
+    return persistEvent(siteId, anomaly, site);
   }
 
   // Resolve a persisted event; if absent, re-derive it deterministically from the
@@ -236,13 +296,14 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     const weather: Weather[] = filterByDate(allWx, day);
     const resolvedRunAt =
       runAt ?? observations[observations.length - 1]?.timestamp ?? site.commissioningDate ?? "";
+    const refWape = referenceWape(day);
     const f = forecastSolarYield({
       site,
       weather,
       observations,
       horizon,
       runAt: resolvedRunAt,
-      ...(referenceWape() !== undefined ? { referenceWape: referenceWape()! } : {}),
+      ...(refWape !== undefined ? { referenceWape: refWape } : {}),
     });
     return {
       site_id: f.siteId,

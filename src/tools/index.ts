@@ -89,8 +89,18 @@ export const detectAssetUnderperformanceTool = tool({
     "Deterministically compare observed vs expected generation over a window and return residual, severity, evidence, and an anomaly_event_id. Data-quality issues short-circuit to severity=data_issue (do not diagnose equipment on bad telemetry).",
   inputSchema: z.object({
     site_id: z.string(),
-    window_start: z.string().optional(),
-    window_end: z.string().optional(),
+    window_start: z
+      .string()
+      .optional()
+      .describe(
+        "Inclusive window start (ISO timestamp). When provided without window_end, scopes to that single local (+08:00) day.",
+      ),
+    window_end: z
+      .string()
+      .optional()
+      .describe(
+        "Inclusive window end (ISO timestamp). When provided without window_start, scopes to that single local (+08:00) day.",
+      ),
   }),
   outputSchema: z.object({
     anomaly_event_id: z.string(),
