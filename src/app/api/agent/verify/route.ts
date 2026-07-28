@@ -1,5 +1,5 @@
 import { runVerification } from "@/agent/verify";
-import { getLedger } from "@/data/ledger";
+import { getRuntimeLedger } from "@/data/runtimeLedger";
 import { jsonError } from "@/lib/http";
 import { createSolarOpsService } from "@/services/solarops";
 
@@ -29,7 +29,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const ledger = getLedger();
+    const ledger = getRuntimeLedger();
     const svc = createSolarOpsService(undefined, { ledger });
     // Optional now override for tests/demo; default wall-clock.
     const now =

@@ -1,5 +1,5 @@
 import { runSweep } from "@/agent/sweep";
-import { getLedger } from "@/data/ledger";
+import { getRuntimeLedger } from "@/data/runtimeLedger";
 import { jsonError } from "@/lib/http";
 import { createSolarOpsService } from "@/services/solarops";
 
@@ -16,7 +16,7 @@ export async function POST(req: Request) {
       as_of_date?: string;
       mode?: "offline" | "live" | "auto";
     };
-    const ledger = getLedger();
+    const ledger = getRuntimeLedger();
     const svc = createSolarOpsService(undefined, { ledger });
     const result = await runSweep({
       svc,

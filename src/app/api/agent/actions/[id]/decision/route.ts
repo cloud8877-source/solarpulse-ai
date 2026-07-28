@@ -1,4 +1,4 @@
-import { getLedger } from "@/data/ledger";
+import { getRuntimeLedger } from "@/data/runtimeLedger";
 import { jsonError } from "@/lib/http";
 import { createSolarOpsService, SolarOpsError } from "@/services/solarops";
 
@@ -52,7 +52,7 @@ export async function POST(
       );
     }
 
-    const ledger = getLedger();
+    const ledger = getRuntimeLedger();
     const svc = createSolarOpsService(undefined, { ledger });
     const now = new Date().toISOString();
 
