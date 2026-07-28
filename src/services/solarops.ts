@@ -652,6 +652,17 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
         return d >= periodStart && d <= day && d <= periodEnd;
       });
 
+    // Daylight predicate via expectedProfile (same helper as detection / green-report).
+    const weather = store
+      .getWeather(siteId)
+      .filter((w) => {
+        const d = dateKey(w.timestamp);
+        return d >= periodStart && d <= day && d <= periodEnd;
+      });
+    const expectedKwhByTimestamp = new Map(
+      expectedProfile(site, weather).map((i) => [i.timestamp, i.expectedKwh]),
+    );
+
     const tariff =
       site.tariffAssumptionRmPerKwh ?? assumptions.retailTariffRmPerKwh;
 
@@ -671,6 +682,7 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
         source: smpEntry.source,
       },
       assumptions,
+      expectedKwhByTimestamp,
     });
 
     const runId = `atap_${siteId}_${day.replace(/-/g, "")}`;
@@ -753,11 +765,15 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
             forfeited_credit_rm: result.projection.forfeitedCreditRm,
             energy_charge_rm: result.projection.energyChargeRm,
             net_energy_charge_rm: result.projection.netEnergyChargeRm,
+            observed_daylight_import_kwh: result.projection.observedDaylightImportKwh,
+            projected_daylight_import_kwh: result.projection.projectedDaylightImportKwh,
+            load_shiftable_export_kwh: result.projection.loadShiftableExportKwh,
           }
         : null,
       value_leak: result.valueLeak
         ? {
             smp_spread_rm: result.valueLeak.smpSpreadRm,
+            smp_spread_ceiling_rm: result.valueLeak.smpSpreadCeilingRm,
             forfeited_credit_rm: result.valueLeak.forfeitedCreditRm,
             floored_credit_lost_rm: result.valueLeak.flooredCreditLostRm,
             total_rm: result.valueLeak.totalRm,

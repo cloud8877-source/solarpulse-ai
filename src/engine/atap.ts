@@ -70,6 +70,13 @@ export interface AtapCreditClockInput {
   asOfDate: string; // YYYY-MM-DD
   averageSmp: AtapAverageSmp;
   assumptions: Assumptions;
+  /**
+   * Expected generation (kWh) per observation timestamp — from the forecast
+   * engine's expectedProfile (same map the detection / green-report paths use).
+   * Daylight-concurrent intervals are those with expected > 0 (green-report
+   * measurable-interval predicate). Missing keys treat as 0 (not daylight).
+   */
+  expectedKwhByTimestamp: Record<string, number> | Map<string, number>;
 }
 
 export interface AtapEligibility {
@@ -112,15 +119,32 @@ export interface AtapProjection {
   forfeitedCreditRm: number;
   energyChargeRm: number;
   netEnergyChargeRm: number;
+  /** Observed import on counted-day intervals with expected generation > 0. */
+  observedDaylightImportKwh: number;
+  /** Linear projection of daylight-concurrent import to the full billing period. */
+  projectedDaylightImportKwh: number;
+  /**
+   * Export kWh that could honestly be recovered by scheduling load into
+   * production hours: min(offsettableExport, projectedDaylightImport).
+   */
+  loadShiftableExportKwh: number;
 }
 
 export interface AtapValueLeak {
-  /** RM that could be saved by self-consuming offsettable export instead of exporting at SMP. */
+  /**
+   * Headline recoverable SMP-spread (RM): load-shiftable export × (avoided − SMP).
+   * Bounded by daylight-concurrent import — no storage assumed.
+   */
   smpSpreadRm: number;
+  /**
+   * Ceiling if ALL offsettable export could be self-consumed (storage / overnight
+   * shift). Not achievable by daytime scheduling alone; excluded from totalRm.
+   */
+  smpSpreadCeilingRm: number;
   forfeitedCreditRm: number;
   /** Credit that would have pushed the net bill below zero (clause (e) floor). */
   flooredCreditLostRm: number;
-  /** Headline "RM evaporating" = smpSpreadRm + forfeitedCreditRm + flooredCreditLostRm. */
+  /** Recoverable "RM evaporating" = smpSpreadRm + forfeitedCreditRm + flooredCreditLostRm. */
   totalRm: number;
 }
 
@@ -194,6 +218,14 @@ function sumNullable(values: Array<number | null | undefined>): number {
   return total;
 }
 
+function expectedAt(
+  map: Record<string, number> | Map<string, number>,
+  timestamp: string,
+): number {
+  if (map instanceof Map) return map.get(timestamp) ?? 0;
+  return map[timestamp] ?? 0;
+}
+
 /** Full LV volumetric stack (energy + capacity + network), RM/kWh. */
 export function lvVolumetricStackRmPerKwh(A: Assumptions): number {
   const c = A.lvVolumetricComponents;
@@ -231,7 +263,8 @@ export function avoidedCostRmPerKwh(
  * All RM rounded to 2 dp; all kWh rounded to 2 dp on output.
  */
 export function computeAtapCreditClock(input: AtapCreditClockInput): AtapCreditClockResult {
-  const { site, observations, asOfDate, averageSmp, assumptions: A } = input;
+  const { site, observations, asOfDate, averageSmp, assumptions: A, expectedKwhByTimestamp } =
+    input;
   const { periodStart, periodEnd, daysInPeriod } = billingPeriodBounds(asOfDate);
   const daysRemaining = calendarDaysBetween(asOfDate, periodEnd);
 
@@ -262,6 +295,15 @@ export function computeAtapCreditClock(input: AtapCreditClockInput): AtapCreditC
   const importKwhRaw = sumNullable(countedRows.map((o) => o.importKwh));
   const exportKwhRaw = sumNullable(countedRows.map((o) => o.exportKwh));
 
+  // Daylight-concurrent import: counted-day rows where expected generation > 0
+  // (same predicate as green-report measurable-interval coverage — NOT generation > 0).
+  let observedDaylightImportKwhRaw = 0;
+  for (const o of countedRows) {
+    if (expectedAt(expectedKwhByTimestamp, o.timestamp) > 0 && o.importKwh != null) {
+      observedDaylightImportKwhRaw += o.importKwh;
+    }
+  }
+
   const generationKwh = round(generationKwhRaw);
   const loadKwh = round(loadKwhRaw);
   const importKwh = round(importKwhRaw);
@@ -284,7 +326,6 @@ export function computeAtapCreditClock(input: AtapCreditClockInput): AtapCreditC
     `Average SMP for preceding month ${averageSmp.monthLabel}: RM ${averageSmp.rmPerKwh}/kWh (${averageSmp.provenance}; ${averageSmp.source})`,
     `retail energy tariff RM ${site.tariffRmPerKwh}/kWh (energy charge only for net bill; site override or config retailTariffRmPerKwh)`,
     `smpSpreadRm avoided-cost rate: ${avoided.label}`,
-    "smpSpreadRm assumes offsettable exported energy could be shifted to self-consumption (load-shift / scheduling) — operational assumption, not a gazette requirement",
     "AFA (Automatic Fuel Adjustment) excluded — credits cannot offset AFA (GP/ST/No.60/2025)",
     `MAQ = ${site.capacityKwp} kWp × ${A.atap.sunHoursPerDay} sun-hours × ${daysInPeriod} days = ${maqKwh} kWh (gazette §2)`,
     "unused ATAP offset credit is forfeited at billing-period end (clause 3.6.1(b); no carry-forward)",
@@ -349,10 +390,19 @@ export function computeAtapCreditClock(input: AtapCreditClockInput): AtapCreditC
   const dailyMeanImport = importKwhRaw / observedDays;
   const projectedExport = dailyMeanExport * daysInPeriod;
   const projectedImport = dailyMeanImport * daysInPeriod;
+  const projectedDaylightImportKwhRaw =
+    (observedDaylightImportKwhRaw / observedDays) * daysInPeriod;
 
   // offsettable = min(export, import, MAQ); remainder of export is forfeited (clause d).
   const offsettableExportKwhRaw = Math.min(projectedExport, projectedImport, maqKwh);
   const forfeitedExportKwhRaw = Math.max(0, projectedExport - offsettableExportKwhRaw);
+
+  // Honest recoverable bound: only daylight-concurrent import can absorb export
+  // via load scheduling (no storage / overnight shift in the product pitch).
+  const loadShiftableExportKwhRaw = Math.min(
+    offsettableExportKwhRaw,
+    projectedDaylightImportKwhRaw,
+  );
 
   const creditRmRaw = offsettableExportKwhRaw * averageSmp.rmPerKwh;
   const forfeitedCreditRmRaw = forfeitedExportKwhRaw * averageSmp.rmPerKwh;
@@ -362,9 +412,22 @@ export function computeAtapCreditClock(input: AtapCreditClockInput): AtapCreditC
   const flooredCreditLostRmRaw = preFloorNetRaw < 0 ? -preFloorNetRaw : 0;
   const netEnergyChargeRmRaw = Math.max(0, preFloorNetRaw);
 
-  // Value leak: avoided-cost-vs-SMP spread on offsettable export + forfeited + floor.
-  const smpSpreadRmRaw = offsettableExportKwhRaw * (avoided.rate - averageSmp.rmPerKwh);
+  // Value leak: headline spread on load-shiftable export; ceiling on full offsettable.
+  const spreadRate = avoided.rate - averageSmp.rmPerKwh;
+  const smpSpreadRmRaw = loadShiftableExportKwhRaw * spreadRate;
+  const smpSpreadCeilingRmRaw = offsettableExportKwhRaw * spreadRate;
   const totalLeakRaw = smpSpreadRmRaw + forfeitedCreditRmRaw + flooredCreditLostRmRaw;
+
+  const observedDaylightImportKwh = round(observedDaylightImportKwhRaw);
+  const projectedDaylightImportKwh = round(projectedDaylightImportKwhRaw);
+  const loadShiftableExportKwh = round(loadShiftableExportKwhRaw);
+  const smpSpreadCeilingRm = round(smpSpreadCeilingRmRaw);
+
+  statedAssumptions.push(
+    `smp_spread_rm bounded by projected daylight-concurrent import (${projectedDaylightImportKwh} kWh/month) — recoverable by load scheduling within production hours; no storage assumed`,
+    `smp_spread_ceiling_rm (RM ${smpSpreadCeilingRm}) assumes ALL offsettable export could be self-consumed — requires storage or overnight load shifting, NOT achievable by scheduling alone`,
+    "daylight-concurrent = intervals with expected generation > 0 (same predicate as green-report measurable-interval coverage)",
+  );
 
   const projection: AtapProjection = {
     method: "linear_daily_mean",
@@ -377,10 +440,14 @@ export function computeAtapCreditClock(input: AtapCreditClockInput): AtapCreditC
     forfeitedCreditRm: round(forfeitedCreditRmRaw),
     energyChargeRm: round(energyChargeRmRaw),
     netEnergyChargeRm: round(netEnergyChargeRmRaw),
+    observedDaylightImportKwh,
+    projectedDaylightImportKwh,
+    loadShiftableExportKwh,
   };
 
   const valueLeak: AtapValueLeak = {
     smpSpreadRm: round(smpSpreadRmRaw),
+    smpSpreadCeilingRm,
     forfeitedCreditRm: round(forfeitedCreditRmRaw),
     flooredCreditLostRm: round(flooredCreditLostRmRaw),
     totalRm: round(totalLeakRaw),
