@@ -67,6 +67,12 @@ export interface Observation {
   siteId: string;
   timestamp: string; // ISO 8601 with +08:00 offset
   generationKwh: number | null; // null = missing telemetry (must never be treated as 0)
+  /** On-site load (kWh). Empty CSV → null, never coerced to 0. */
+  loadKwh: number | null;
+  /** Grid import (kWh). Empty CSV → null, never coerced to 0. */
+  importKwh: number | null;
+  /** Grid export (kWh). Empty CSV → null, never coerced to 0. */
+  exportKwh: number | null;
   inverterId: string | null;
   stringId: string | null;
   availability: number | null;

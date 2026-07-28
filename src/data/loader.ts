@@ -82,6 +82,10 @@ export function loadObservations(): Observation[] {
     siteId: r.site_id!,
     timestamp: r.timestamp!,
     generationKwh: num(r.generation_kwh), // null when missing — preserved deliberately
+    // load / import / export: empty CSV fields stay null (never coerced to 0)
+    loadKwh: num(r.load_kwh),
+    importKwh: num(r.import_kwh),
+    exportKwh: num(r.export_kwh),
     inverterId: strOrNull(r.inverter_id),
     stringId: strOrNull(r.string_id),
     availability: num(r.availability),
