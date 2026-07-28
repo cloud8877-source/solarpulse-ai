@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { WeatherBadge } from "@/app/components/WeatherBadge";
 import { solarOps } from "@/services/solarops";
 import { Kpi, StatusBadge, fmtInt, fmtPct } from "@/app/components/ui";
 
@@ -13,7 +14,11 @@ export default function Home() {
     <main className="container">
       <div className="section-title">
         <h1>Portfolio Overview</h1>
-        <span className="muted">Window {windowDate} · fixture demo data</span>
+        <span className="muted" style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          Window {windowDate} · fixture demo data
+          <WeatherBadge siteId="site_a" />
+          <Link href="/agent">KREDIT ops feed →</Link>
+        </span>
       </div>
 
       <div className="grid kpi-grid" style={{ marginBottom: 20 }}>

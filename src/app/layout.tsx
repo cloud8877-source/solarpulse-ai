@@ -21,7 +21,15 @@ export default function RootLayout({ children }: { children: ReactNode }) {
               <small>Solar Asset Performance &amp; Grid Intelligence</small>
             </span>
           </Link>
-          <span className="badge tag">MAIC T1 · demo fixture data</span>
+          <nav className="app-nav" style={{ display: "flex", alignItems: "center", gap: 14 }}>
+            <Link href="/" className="muted" style={{ fontSize: "0.88rem" }}>
+              Portfolio
+            </Link>
+            <Link href="/agent" className="muted" style={{ fontSize: "0.88rem" }}>
+              KREDIT ops
+            </Link>
+            <span className="badge tag">MAIC T1 · demo fixture data</span>
+          </nav>
         </header>
         {children}
       </body>
