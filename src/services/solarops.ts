@@ -160,6 +160,19 @@ export interface ActionVerbs {
     id: string,
     meta: { policyDecisions: PolicyDecision[]; decidedAt?: string },
   ): Promise<ActionCommitment>;
+  /**
+   * Human operator deny (awaiting_approval → denied_by_policy).
+   * decidedBy REQUIRED non-blank (C2); records policyId human_rejected.
+   * Distinct from denyByPolicy (governor path — no human signature).
+   */
+  denyAction(
+    id: string,
+    opts: {
+      decidedBy: string;
+      decidedAt?: string;
+      reason?: string;
+    },
+  ): Promise<ActionCommitment>;
   approveAction(
     id: string,
     opts: {
@@ -1106,6 +1119,43 @@ export function createSolarOpsService(
   }
 
   /**
+   * Human operator deny: awaiting_approval → denied_by_policy (also legal from
+   * proposed). decidedBy REQUIRED non-blank (mirrors approveAction / C2).
+   * Appends a policyDecision { policyId: 'human_rejected', outcome: 'deny' }.
+   * Governor denials use denyByPolicy — never this verb.
+   */
+  async function denyAction(
+    id: string,
+    opts: { decidedBy: string; decidedAt?: string; reason?: string },
+  ): Promise<ActionCommitment> {
+    const signer = opts.decidedBy?.trim();
+    if (!signer) {
+      throw new SolarOpsError(
+        "illegal_field",
+        "denyAction requires non-blank decidedBy (human operator)",
+      );
+    }
+    try {
+      const current = await ledger().getAction(id);
+      if (!current) {
+        throw new LedgerError("not_found", `Unknown action '${id}'`);
+      }
+      const humanDecision: PolicyDecision = {
+        policyId: "human_rejected",
+        outcome: "deny",
+        reason: opts.reason?.trim() || `Rejected by operator ${signer}`,
+      };
+      return await ledger().transitionAction(id, "denied_by_policy", {
+        decidedBy: signer,
+        decidedAt: opts.decidedAt ?? new Date().toISOString(),
+        policyDecisions: [...current.policyDecisions, humanDecision],
+      });
+    } catch (err) {
+      mapLedgerError(err);
+    }
+  }
+
+  /**
    * awaiting_approval → approved. decidedBy is REQUIRED here (C2: never a
    * model-authored tool argument — only UI/API or governor auto path).
    */
@@ -1345,6 +1395,7 @@ export function createSolarOpsService(
     proposeAction,
     requestApproval,
     denyByPolicy,
+    denyAction,
     approveAction,
     issueAction,
     verifyAction,

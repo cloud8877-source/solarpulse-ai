@@ -436,9 +436,18 @@ export async function runSweep(opts: RunSweepOptions = {}): Promise<SweepResult>
         plan.siteId,
         thisSweepId,
       );
+      // I5-7: already-written skip is keyed by (siteId, kind, deadline) within
+      // this sweep — not candidate.id. C4 retries can reallocate ids, so an
+      // id lookup would miss a row the live loop already committed.
+      const writtenThisSweep = await ledger.listActions({
+        siteId: plan.siteId,
+        sweepId: thisSweepId,
+      });
       for (const candidate of plan.candidates) {
-        const existing = await ledger.getAction(candidate.id);
-        if (existing) continue;
+        const alreadyWritten = writtenThisSweep.some(
+          (r) => r.kind === candidate.kind && r.deadline === candidate.deadline,
+        );
+        if (alreadyWritten) continue;
         const gctx: GovernorContext = {
           siteEligible: plan.eligible,
           severity: plan.severity as GovernorContext["severity"],
@@ -448,6 +457,7 @@ export async function runSweep(opts: RunSweepOptions = {}): Promise<SweepResult>
         const gov = evaluate(candidate, gctx);
         decisionsById.set(candidate.id, gov.decisions);
         const row = await recordCandidateOffline(svc, candidate, gov, now);
+        writtenThisSweep.push(row);
         actionIds.push(row.id);
         if (gov.status === "denied") {
           blockedActions += 1;

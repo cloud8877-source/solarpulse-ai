@@ -735,6 +735,83 @@ describe("live-loop mock: denied feeds back then escalate (I5-2/I5-5)", () => {
   });
 });
 
+describe("I5-7 reconciliation skip key (siteId, kind, deadline)", () => {
+  it("skips already-written rows even when candidate id was reallocated (C4)", async () => {
+    const { svc, ledger } = fresh();
+    const thisSweepId = `swp_${AS_OF.replace(/-/g, "")}`;
+    const clock = svc.atapCreditClock("site_a", AS_OF);
+    const deadline = clock.coverage.period_end;
+
+    // Simulate a live-loop write after C4 id reallocation: same site/kind/deadline
+    // and sweep, but a different id than the deterministic candidate id (seq 1).
+    const reallocatedId = actionId("site_a", AS_OF, 99);
+    await ledger.saveAction({
+      id: reallocatedId,
+      siteId: "site_a",
+      sweepId: thisSweepId,
+      kind: "load_shift",
+      title: "Pre-written load_shift (simulates C4 reallocated id)",
+      description: "Already on ledger under a different id.",
+      rmImpact: SITE_A_RM_IMPACT,
+      kwhImpact: clock.projection!.load_shiftable_export_kwh,
+      confidence: "high",
+      evidenceRefs: ["prewrite"],
+      deadline,
+      approvalClass: "human_signature",
+      status: "proposed",
+      policyDecisions: [],
+      verification: null,
+      createdAt: NOW,
+      decidedAt: null,
+      decidedBy: null,
+    });
+    await ledger.transitionAction(reallocatedId, "awaiting_approval", {
+      policyDecisions: [
+        {
+          policyId: "pol_human_signature",
+          outcome: "require_approval",
+          reason: "pre-written",
+        },
+      ],
+    });
+
+    // Live model that immediately stops — reconciliation is the only writer.
+    const model = new MockLanguageModelV4({
+      doGenerate: async () => ({
+        content: [{ type: "text", text: "done" }],
+        finishReason: { unified: "stop", raw: undefined },
+        usage: {
+          inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
+          outputTokens: { total: 1, text: 1, reasoning: undefined },
+        },
+        warnings: [],
+      }),
+    });
+
+    const result = await runSweep({
+      svc,
+      ledger,
+      asOfDate: AS_OF,
+      now: NOW,
+      mode: "live",
+      model,
+      maxSteps: 2,
+    });
+
+    expect(result.mode).toBe("live");
+    expect(result.sweep.id).toBe(thisSweepId);
+    expect(result.sweep.notes.some((n) => n.startsWith("reconcile="))).toBe(true);
+
+    const siteALoads = (await ledger.listActions({ siteId: "site_a", sweepId: thisSweepId })).filter(
+      (a) => a.kind === "load_shift" && a.deadline === deadline,
+    );
+    // Must NOT double-write: still exactly one load_shift for this key.
+    expect(siteALoads).toHaveLength(1);
+    expect(siteALoads[0]!.id).toBe(reallocatedId);
+    expect(siteALoads[0]!.status).toBe("awaiting_approval");
+  });
+});
+
 describe("proposeCreditActionsDeterministic honesty", () => {
   it("every load_shift number traces to the ATAP DTO", async () => {
     const { svc } = fresh();
