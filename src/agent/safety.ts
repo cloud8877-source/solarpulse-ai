@@ -2,10 +2,9 @@
 //
 // PRIMARY defense = numeric grounding: every unit-bearing quantitative claim (kWh,
 // MWh, RM, %, kg) in the answer must trace to a number in that turn's tool outputs,
-// within tolerance and across kWh<->MWh / fraction<->percent normalization, matched
-// against the TOOL's value (not the prompt's). This is phrasing-independent, so a
-// fabricated "RM 50,000" or a stale "13.1%" that doesn't match the real tool output
-// is caught regardless of wording.
+// within tolerance and across unit-class-aware normalization, matched against the
+// TOOL's value (not the prompt's). Pool numbers are classified by their JSON key so
+// bare counts / carbon factors cannot ground energy or mass claims via x1000/x100.
 //
 // SECONDARY = a negation-guarded denylist for qualitative claims (fake dispatch,
 // guaranteed savings, control/trading) that carry no number for grounding to catch.
@@ -23,8 +22,27 @@ export interface SafetyResult {
   blockedPhrases: { phrase: string; reason: string }[];
 }
 
+/** Unit class of a number drawn from tool-output JSON, derived from its key. */
+export type UnitClass =
+  | "energy"
+  | "currency"
+  | "mass_co2"
+  | "percent_ratio"
+  | "count"
+  | "unclassified";
+
+interface PooledNumber {
+  value: number;
+  unitClass: UnitClass;
+}
+
 const GROUNDING_TOLERANCE = 0.02; // relative
-const MULTIPLIERS = [1, 100, 0.01, 1000, 0.001]; // fraction<->percent, kWh<->MWh
+
+/** kWh <-> MWh (and kg <-> tonne) conversion only — no bare x100 / x0.01. */
+const ENERGY_MASS_MULT = [1, 1000, 0.001];
+/** fraction <-> percent. */
+const PERCENT_MULT = [1, 100, 0.01];
+const IDENTITY_MULT = [1];
 
 function toNumber(s: string): number {
   return parseFloat(s.replace(/,/g, ""));
@@ -59,22 +77,117 @@ export function extractClaims(text: string): GroundingClaim[] {
   return claims;
 }
 
-export function collectToolNumbers(toolOutputs: unknown[]): number[] {
-  const nums: number[] = [];
-  const walk = (v: unknown): void => {
-    if (typeof v === "number" && Number.isFinite(v)) nums.push(Math.abs(v));
-    else if (Array.isArray(v)) v.forEach(walk);
-    else if (v && typeof v === "object") Object.values(v).forEach(walk);
+/**
+ * Classify a JSON key into a unit class. Order matters: energy wins over mass for
+ * rates like carbon_factor_kgco2_per_kwh (contains both "kwh" and "carbon"), so a
+ * kg claim cannot ground via the carbon factor ×1000.
+ */
+export function classifyKey(key: string | null | undefined): UnitClass {
+  if (key == null || key === "") return "unclassified";
+  const k = key.toLowerCase();
+
+  // ENERGY: ends _kwh/_mwh or contains kwh/mwh (covers camelCase …PerKwh too)
+  if (k.includes("kwh") || k.includes("mwh")) return "energy";
+
+  // CURRENCY: _rm / rm_
+  if (k.includes("_rm") || k.includes("rm_")) return "currency";
+
+  // MASS_CO2: _kg / _kgco2 / co2_kg / carbon
+  if (
+    k.includes("_kg") ||
+    k.includes("kgco2") ||
+    k.includes("co2_kg") ||
+    k.includes("carbon")
+  ) {
+    return "mass_co2";
+  }
+
+  // PERCENT_RATIO: _pct / _ratio / fraction / residual
+  if (
+    k.includes("_pct") ||
+    k.includes("pct") ||
+    k.includes("_ratio") ||
+    k.includes("ratio") ||
+    k.includes("fraction") ||
+    k.includes("residual")
+  ) {
+    return "percent_ratio";
+  }
+
+  // COUNT: interval / count / days / _n / hours / observed_days
+  if (
+    k.includes("interval") ||
+    k.includes("count") ||
+    k.includes("days") ||
+    k.includes("_n") ||
+    k.includes("hours") ||
+    k.includes("observed_days")
+  ) {
+    return "count";
+  }
+
+  return "unclassified";
+}
+
+/** Multipliers allowed when matching a claim unit against a pooled unit class.
+ *  null = this pool entry cannot ground this claim. COUNT grounds nothing with units. */
+function allowedMultipliers(
+  claimUnit: GroundingClaim["unit"],
+  poolClass: UnitClass,
+): number[] | null {
+  if (poolClass === "count") return null;
+
+  switch (claimUnit) {
+    case "kwh":
+    case "mwh":
+      if (poolClass === "energy") return ENERGY_MASS_MULT;
+      if (poolClass === "unclassified") return IDENTITY_MULT;
+      return null;
+    case "rm":
+      if (poolClass === "currency" || poolClass === "unclassified") return IDENTITY_MULT;
+      return null;
+    case "kg":
+      // kg <-> tonne conversion on mass-class and unclassified
+      if (poolClass === "mass_co2" || poolClass === "unclassified") return ENERGY_MASS_MULT;
+      return null;
+    case "percent":
+      if (poolClass === "percent_ratio" || poolClass === "unclassified") return PERCENT_MULT;
+      return null;
+    default:
+      return null;
+  }
+}
+
+function collectClassifiedToolNumbers(toolOutputs: unknown[]): PooledNumber[] {
+  const nums: PooledNumber[] = [];
+  const walk = (v: unknown, key: string | null): void => {
+    if (typeof v === "number" && Number.isFinite(v)) {
+      nums.push({ value: Math.abs(v), unitClass: classifyKey(key) });
+    } else if (Array.isArray(v)) {
+      // Bare array elements have no own key → unclassified
+      v.forEach((item) => walk(item, null));
+    } else if (v && typeof v === "object") {
+      for (const [k, child] of Object.entries(v as Record<string, unknown>)) {
+        walk(child, k);
+      }
+    }
   };
-  toolOutputs.forEach(walk);
+  toolOutputs.forEach((o) => walk(o, null));
   return nums;
 }
 
-function isGrounded(canonical: number, pool: number[]): boolean {
-  const cv = Math.abs(canonical);
+/** Flat absolute numbers from tool outputs (public helper; class is used only internally). */
+export function collectToolNumbers(toolOutputs: unknown[]): number[] {
+  return collectClassifiedToolNumbers(toolOutputs).map((p) => p.value);
+}
+
+function isGrounded(claim: GroundingClaim, pool: PooledNumber[]): boolean {
+  const cv = Math.abs(claim.canonical);
   if (cv === 0) return true; // zero ("0 kWh recovery") is always safe
-  for (const t of pool) {
-    for (const k of MULTIPLIERS) {
+  for (const { value: t, unitClass } of pool) {
+    const mults = allowedMultipliers(claim.unit, unitClass);
+    if (!mults) continue;
+    for (const k of mults) {
       const cand = t * k;
       if (cand !== 0 && Math.abs(cv - cand) / Math.abs(cand) <= GROUNDING_TOLERANCE) return true;
     }
@@ -112,8 +225,8 @@ export function checkDenylist(text: string): { phrase: string; reason: string }[
 }
 
 export function validateAnswer(answer: string, toolOutputs: unknown[]): SafetyResult {
-  const pool = collectToolNumbers(toolOutputs);
-  const ungroundedClaims = extractClaims(answer).filter((c) => !isGrounded(c.canonical, pool));
+  const pool = collectClassifiedToolNumbers(toolOutputs);
+  const ungroundedClaims = extractClaims(answer).filter((c) => !isGrounded(c, pool));
   const blockedPhrases = checkDenylist(answer);
   const grounded = ungroundedClaims.length === 0;
   return {
