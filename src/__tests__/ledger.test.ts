@@ -273,13 +273,16 @@ describe("buildDemoSeed", () => {
 
     const [verified, falsified, denied] = seed.actions;
     expect(verified!.status).toBe("issued");
+    expect(verified!.kind).toBe("load_shift");
     expect(verified!.verification?.outcome).toBe("verified");
     expect(verified!.evidenceRefs).toContain("seed_fixture");
     expect(verified!.id).toBe(actionId("site_a", "2026-06-24", 1));
 
     expect(falsified!.status).toBe("issued");
+    expect(falsified!.kind).toBe("load_shift");
     expect(falsified!.verification?.outcome).toBe("falsified");
     expect(falsified!.evidenceRefs).toContain("seed_fixture");
+    expect(falsified!.id).toBe(actionId("site_b", "2026-06-24", 2));
 
     expect(denied!.status).toBe("denied_by_policy");
     expect(denied!.verification).toBeNull();

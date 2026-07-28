@@ -229,10 +229,10 @@ export function buildDemoSeed(nowIso: string): DemoSeed {
     id: actionId("site_b", priorDate, 2),
     siteId: "site_b",
     sweepId: swp,
-    kind: "reschedule_maintenance",
-    title: "[SEED] Reschedule inverter clean — falsified",
+    kind: "load_shift",
+    title: "[SEED] Shift chiller load earlier — falsified",
     description:
-      "Historical seed fixture: issued but later meter-falsified (no measured lift).",
+      "Historical seed fixture: load-shift commitment issued but later meter-falsified (missed RM target).",
     rmImpact: 210,
     kwhImpact: 900,
     confidence: "medium",
@@ -244,7 +244,7 @@ export function buildDemoSeed(nowIso: string): DemoSeed {
       {
         policyId: "pol_human_signature",
         outcome: "require_approval",
-        reason: "Maintenance window change needs sign-off",
+        reason: "RM impact above auto threshold",
       },
     ],
     verification: {

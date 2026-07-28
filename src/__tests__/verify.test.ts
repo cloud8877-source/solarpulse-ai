@@ -202,8 +202,18 @@ describe("runVerification full loop (CE7-verifier / I6b coverage gate)", () => {
     expect(row?.status).toBe("issued");
     expect(row?.verification).toBeNull();
 
+    // SEED rows already graded offline → verification_already_set skip path.
+    const alreadySet = result.rows.find(
+      (r) =>
+        r.disposition === "skipped" &&
+        /verification_already_set|already/i.test(r.note),
+    );
+    expect(alreadySet).toBeDefined();
+    expect(alreadySet!.note).toMatch(/verification_already_set|already/i);
+
     // SEED falsified beat still present and unchanged (graded offline in seed).
     const seedFalsified = await ledger.getAction(SEED_FALSIFIED_ID);
+    expect(seedFalsified?.kind).toBe("load_shift");
     expect(seedFalsified?.verification?.outcome).toBe("falsified");
     expect(seedFalsified?.rmImpact).toBe(SEED_FALSIFIED_RM_IMPACT);
     expect(seedFalsified?.verification?.measuredRm).toBe(SEED_FALSIFIED_MEASURED);
@@ -422,8 +432,15 @@ describe("synthetic full-coverage grades all three bands (gate does not break re
       expect(byId[id]?.disposition).toBe("graded");
       expect(byId[id]?.outcome).toBe(expectedOutcomes[i]);
       expect(byId[id]?.measured_rm).toBe(expectedMeasured[i]);
-      expect((await ledger.getAction(id))?.verification?.outcome).toBe(
-        expectedOutcomes[i],
+      const verification = (await ledger.getAction(id))?.verification;
+      expect(verification?.outcome).toBe(expectedOutcomes[i]);
+      // Grade disclosure payload must be written — not just outcome/measuredRm.
+      expect(verification?.assumptions).toBeDefined();
+      expect(verification!.assumptions!.some((a) => a.includes("verifyCoverageFloor"))).toBe(
+        true,
+      );
+      expect(verification!.assumptions!.some((a) => a.includes("verifyTolerancePct"))).toBe(
+        true,
       );
     }
   });

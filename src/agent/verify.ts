@@ -254,8 +254,9 @@ export async function runVerification(
     const floor = assumptions.kredit.verifyCoverageFloor;
 
     // Coverage gate: refuse permanent grades on partial-period actuals.
-    // Spurious FALSIFIED cannot be corrected (verification_already_set) —
-    // leave the action ungraded for a future full-coverage period.
+    // Spurious FALSIFIED cannot be corrected (verification_already_set).
+    // Period is deadline-pinned (e.g. June); coverage never grows for this
+    // closed period, so the action is PERMANENTLY ungraded — not deferred.
     if (coverageRatio < floor) {
       skipped += 1;
       const pct = (coverageRatio * 100).toFixed(1);
