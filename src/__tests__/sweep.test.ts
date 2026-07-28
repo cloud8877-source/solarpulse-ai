@@ -13,10 +13,13 @@
  *  - (b) verifyAction re-grade → verification_already_set / ledger_error
  *  - (c) decidedBy absent from both tool schemas
  * C4 retry on already_exists
- * Live-loop mock: denied commit_action then escalate (MockLanguageModelV4)
+ * Live-loop mock: denied commit_action then escalate (MockLanguageModelV4);
+ *   reconciliation records the durable denied row (I5-2 / I5-5)
+ * I5-1: tool context must not expose getLedger
+ * I5-3: denied/expired dedupe only same asOfDate
+ * I5-4: C4 exhaustion message contains date string
  */
 import { describe, expect, it } from "vitest";
-import { ToolLoopAgent, stepCountIs } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import { z } from "zod";
 import { evaluate } from "../agent/governor";
@@ -29,15 +32,23 @@ import {
   GOVERNOR_AUTO_PRINCIPAL,
   SolarOpsError,
   type ActionCandidate,
+  type ActionVerbs,
 } from "../services/solarops";
 import {
   commitActionInputSchema,
   createActionTools,
   escalateInputSchema,
+  type ActionToolContext,
 } from "../tools/actions";
 
 const AS_OF = "2026-06-21";
 const NOW = "2026-06-21T09:00:00+08:00";
+/**
+ * Clean-data day for site_c: healthy + medium confidence (obs≥2).
+ * 06-18 is healthy but confidence=low (1 observed day) → evidence_required deny.
+ */
+const CLEAN_DAY = "2026-06-19";
+const CLEAN_NOW = "2026-06-19T09:00:00+08:00";
 
 // site_a smp_spread_rm pin (from atap.test F15 / integration):
 // load_shiftable 5241.15 × 0.3175 = 1664.07
@@ -165,6 +176,58 @@ describe("KREDIT offline runSweep end-to-end (fixtures)", () => {
     expect(first.actionIds.length).toBeGreaterThan(0);
   });
 
+  it("I5-3: denied_by_policy dedupes only same asOfDate — clean day recovers load_shift", async () => {
+    const { svc, ledger } = fresh();
+
+    // Day with data_issue: site_c load_shift denied (deadline = period end).
+    const deniedRun = await runSweep({
+      svc,
+      ledger,
+      asOfDate: AS_OF,
+      now: NOW,
+      mode: "offline",
+    });
+    const denied = (await ledger.listActions({ siteId: "site_c" })).find(
+      (a) =>
+        a.sweepId === deniedRun.sweep.id &&
+        a.kind === "load_shift" &&
+        a.status === "denied_by_policy",
+    );
+    expect(denied).toBeDefined();
+    expect(denied!.createdAt.slice(0, 10)).toBe(AS_OF);
+    const deadline = denied!.deadline;
+    const countAfterDeny = (await ledger.listActions()).length;
+
+    // Same day again → still zero new rows (denied still blocks same asOfDate).
+    const sameDay = await runSweep({
+      svc,
+      ledger,
+      asOfDate: AS_OF,
+      now: NOW,
+      mode: "offline",
+    });
+    expect((await ledger.listActions()).length).toBe(countAfterDeny);
+    expect(sameDay.actionIds).toHaveLength(0);
+
+    // Clean-data day (healthy site_c): prior denial must NOT block load_shift.
+    const recovered = await runSweep({
+      svc,
+      ledger,
+      asOfDate: CLEAN_DAY,
+      now: CLEAN_NOW,
+      mode: "offline",
+    });
+    const freshLoad = (await ledger.listActions({ siteId: "site_c" })).find(
+      (a) =>
+        a.sweepId === recovered.sweep.id &&
+        a.kind === "load_shift" &&
+        a.deadline === deadline,
+    );
+    expect(freshLoad).toBeDefined();
+    expect(freshLoad!.status).toBe("awaiting_approval");
+    expect(freshLoad!.id).not.toBe(denied!.id);
+  });
+
   it("prints offline sweep results for all 3 sites (status + policy + rm)", async () => {
     const { svc, ledger } = fresh();
     await runSweep({ svc, ledger, asOfDate: AS_OF, now: NOW, mode: "offline" });
@@ -249,10 +312,61 @@ describe("C4 proposeAction already_exists retry", () => {
     expect(await ledger.getAction(colliding)).not.toBeNull();
     expect(await ledger.getAction(saved.id)).not.toBeNull();
   });
+
+  it("I5-4: C4 exhaustion error message contains the date string (not Function)", async () => {
+    const { svc, ledger } = fresh();
+    const day = AS_OF;
+    const colliding = actionId("site_a", day, 1);
+    await svc.proposeAction({
+      id: colliding,
+      siteId: "site_a",
+      sweepId: "swp_exh",
+      kind: "load_shift",
+      title: "pre",
+      description: "seed for exhaustion",
+      rmImpact: 1,
+      kwhImpact: 1,
+      confidence: "medium",
+      evidenceRefs: ["pre"],
+      deadline: "2026-06-30",
+      approvalClass: "human_signature",
+      createdAt: NOW,
+    });
+    // Force every retry onto the same colliding id so maxRetries exhausts.
+    ledger.nextSeq = async () => 1;
+
+    let caught: unknown;
+    try {
+      await svc.proposeAction({
+        id: colliding,
+        siteId: "site_a",
+        sweepId: "swp_exh2",
+        kind: "load_shift",
+        title: "will fail",
+        description: "exhaust retries",
+        rmImpact: 1,
+        kwhImpact: 1,
+        confidence: "medium",
+        evidenceRefs: ["x"],
+        deadline: "2026-06-30",
+        approvalClass: "human_signature",
+        createdAt: NOW,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SolarOpsError);
+    const msg = (caught as SolarOpsError).message;
+    // Must interpolate the local idDateKey string, never the dateKey Function.
+    expect(msg).toContain(day);
+    expect(msg).toMatch(/2026-06-21/);
+    expect(msg).not.toMatch(/function/i);
+    expect(msg).toMatch(/exhausted/);
+  });
 });
 
 describe("CE7 tool surface + service verbs", () => {
-  function toolCtx(svc: ReturnType<typeof createSolarOpsService>, candidates: ActionCandidate[]) {
+  function toolCtx(svc: ActionVerbs, candidates: ActionCandidate[]) {
     const byId = new Map(candidates.map((c) => [c.id, c]));
     const decisions = new Map<string, ReturnType<typeof evaluate>["decisions"]>();
     return createActionTools({
@@ -272,6 +386,37 @@ describe("CE7 tool surface + service verbs", () => {
       now: NOW,
     });
   }
+
+  it("I5-1: tool context / service must not expose getLedger (ledger leak attack)", () => {
+    const { svc } = fresh();
+    // Public service return: getLedger is gone.
+    expect(
+      (svc as { getLedger?: unknown }).getLedger,
+    ).toBeUndefined();
+    expect(typeof (svc as { getLedger?: unknown }).getLedger).toBe("undefined");
+    expect(Object.prototype.hasOwnProperty.call(svc, "getLedger")).toBe(false);
+
+    // ActionToolContext.svc is ActionVerbs — same runtime object, no ledger.
+    const ctx: ActionToolContext = {
+      svc,
+      getCandidate: () => undefined,
+      getCandidatesForSite: () => [],
+      getDecisions: () => undefined,
+      setDecisions: () => {},
+      getGroundingOutputs: () => [],
+      now: NOW,
+    };
+    expect(
+      (ctx.svc as { getLedger?: unknown }).getLedger,
+    ).toBeUndefined();
+    expect(typeof (ctx.svc as { getLedger?: unknown }).getLedger).toBe(
+      "undefined",
+    );
+    // Narrow type surface: no raw ledger / transitionAction on ActionVerbs.
+    expect(
+      (ctx.svc as { transitionAction?: unknown }).transitionAction,
+    ).toBeUndefined();
+  });
 
   it("CE7-(a): payload carrying decidedBy → illegal_field on proposeAction", async () => {
     const { svc } = fresh();
@@ -431,40 +576,61 @@ describe("CE7 tool surface + service verbs", () => {
   });
 });
 
-describe("live-loop mock: denied feeds back then escalate", () => {
-  it("MockLanguageModelV4: commit_action denied → agent calls escalate", async () => {
+describe("live-loop mock: denied feeds back then escalate (I5-2/I5-5)", () => {
+  it("MockLanguageModelV4 via runSweep: commit denied → escalate; reconciliation records deny row", async () => {
     const { svc, ledger } = fresh();
-    // Build site_c candidates (load_shift will be governor-denied on data_issue).
-    const candidates = await svc.proposeCreditActionsDeterministic("site_c", AS_OF, {
-      sweepId: "swp_live",
-      now: NOW,
-    });
-    const load = candidates.find((c) => c.kind === "load_shift");
-    const esc = candidates.find((c) => c.kind === "escalate");
-    expect(load).toBeDefined();
-    expect(esc).toBeDefined();
 
-    const clock = svc.atapCreditClock("site_c", AS_OF, NOW);
-    const detect = svc.detectAssetUnderperformance("site_c", undefined, undefined, AS_OF);
-    const known = [clock.source_manifest.runId, detect.anomaly_event_id];
-    const decisions = new Map<string, ReturnType<typeof evaluate>["decisions"]>();
-    const tools = createActionTools({
-      svc,
-      getCandidate: (id) => candidates.find((c) => c.id === id),
-      getCandidatesForSite: (siteId) => candidates.filter((c) => c.siteId === siteId),
-      getDecisions: (id) => decisions.get(id),
-      setDecisions: (id, d) => {
-        decisions.set(id, d);
-      },
-      getGroundingOutputs: () => [clock, detect, ...candidates],
-      now: NOW,
-    });
+    /** Flatten LanguageModelV4 prompt messages into searchable text. */
+    function flattenPrompt(options: unknown): string {
+      const prompt = (options as { prompt?: unknown }).prompt;
+      if (typeof prompt === "string") return prompt;
+      if (Array.isArray(prompt)) {
+        return prompt
+          .map((m: { role?: string; content?: unknown }) => {
+            if (typeof m.content === "string") return m.content;
+            if (Array.isArray(m.content)) {
+              return m.content
+                .map((part: { type?: string; text?: string }) =>
+                  typeof part.text === "string" ? part.text : JSON.stringify(part),
+                )
+                .join("\n");
+            }
+            return JSON.stringify(m.content ?? "");
+          })
+          .join("\n");
+      }
+      return JSON.stringify(options);
+    }
+
+    function parseCandidate(
+      promptText: string,
+      siteId: string,
+      kind: string,
+    ): { id: string; evidence: string; desc: string } | null {
+      const siteBlock = promptText
+        .split(/Site /)
+        .find((b) => b.startsWith(siteId));
+      if (!siteBlock) return null;
+      const re = new RegExp(
+        `id=(\\S+) kind=${kind} rmImpact=\\S+ deadline=\\S+ evidence=(\\S+)\\n\\s+desc: (.+)`,
+      );
+      const m = siteBlock.match(re);
+      if (!m) return null;
+      return { id: m[1]!, evidence: m[2]!.split("|")[0]!, desc: m[3]!.trim() };
+    }
 
     let calls = 0;
+    let listing = "";
     const model = new MockLanguageModelV4({
-      doGenerate: async () => {
+      doGenerate: async (options) => {
         calls += 1;
+        const src = flattenPrompt(options);
+        if (src.includes("id=")) listing = src;
+        const text = listing || src;
+
         if (calls === 1) {
+          const load = parseCandidate(text, "site_c", "load_shift");
+          expect(load).not.toBeNull();
           return {
             content: [
               {
@@ -474,7 +640,7 @@ describe("live-loop mock: denied feeds back then escalate", () => {
                 input: JSON.stringify({
                   site_id: "site_c",
                   candidate_id: load!.id,
-                  narrative: load!.description,
+                  narrative: load!.desc,
                 }),
               },
             ],
@@ -487,6 +653,8 @@ describe("live-loop mock: denied feeds back then escalate", () => {
           };
         }
         if (calls === 2) {
+          const esc = parseCandidate(text, "site_c", "escalate");
+          expect(esc).not.toBeNull();
           return {
             content: [
               {
@@ -496,7 +664,7 @@ describe("live-loop mock: denied feeds back then escalate", () => {
                 input: JSON.stringify({
                   site_id: "site_c",
                   reason: "data_issue blocks load_shift",
-                  evidence_ref: esc!.evidenceRefs[0]!,
+                  evidence_ref: esc!.evidence,
                 }),
               },
             ],
@@ -520,54 +688,50 @@ describe("live-loop mock: denied feeds back then escalate", () => {
       },
     });
 
-    const agent = new ToolLoopAgent({
+    const result = await runSweep({
+      svc,
+      ledger,
+      asOfDate: AS_OF,
+      now: NOW,
+      mode: "live",
       model,
-      tools,
-      toolApproval: async ({ toolCall }) => {
-        const input = toolCall.input as Record<string, unknown>;
-        let cand: ActionCandidate | undefined;
-        if (toolCall.toolName === "commit_action") {
-          cand = candidates.find((c) => c.id === input.candidate_id);
-        } else if (toolCall.toolName === "escalate") {
-          cand = esc;
-        }
-        if (!cand) return { type: "denied", reason: "unknown" };
-        const gov = evaluate(cand, {
-          siteEligible: true,
-          severity: "data_issue",
-          knownEvidenceRefs: known,
-          nonEscalateCountThisSweep: 0,
-        });
-        decisions.set(cand.id, gov.decisions);
-        if (gov.status === "denied") {
-          // Mirror offline: still record denied row so the beat is durable.
-          // (toolApproval deny means execute does not run — record here for parity
-          //  with offline path; live runSweep offline-fallback also covers this.)
-          return {
-            type: "denied",
-            reason: gov.decisions.at(-1)?.policyId ?? "denied",
-          };
-        }
-        return { type: "approved", reason: gov.status };
-      },
-      stopWhen: stepCountIs(5),
+      maxSteps: 8,
     });
 
-    const result = await agent.generate({ prompt: "run site_c sweep" });
+    expect(result.mode).toBe("live");
     expect(calls).toBeGreaterThanOrEqual(2);
-    // escalate executed after deny
-    const escResult = (result.toolResults ?? []).find((t) => t.toolName === "escalate");
-    expect(escResult).toBeDefined();
-    const out = escResult!.output as { status: string; decided_by: string };
-    expect(out.status).toBe("issued");
-    expect(out.decided_by).toBe(GOVERNOR_AUTO_PRINCIPAL);
+    expect(result.sweep.notes.some((n) => n.startsWith("reconcile="))).toBe(true);
 
-    // commit_action must NOT have executed (denied by toolApproval)
-    const loadRow = await ledger.getAction(load!.id);
-    expect(loadRow).toBeNull();
+    // Live path: toolApproval denied commit_action (execute never ran).
+    // I5-2 reconciliation is the single writer for denials — durable red card.
+    const siteC = (await ledger.listActions({ siteId: "site_c" })).filter(
+      (a) => a.sweepId === result.sweep.id,
+    );
+    const loadRow = siteC.find((a) => a.kind === "load_shift");
+    expect(loadRow).not.toBeNull();
+    expect(loadRow).toBeDefined();
+    expect(loadRow!.status).toBe("denied_by_policy");
+    expect(
+      loadRow!.policyDecisions.some(
+        (d) => d.policyId === "no_action_on_bad_data" && d.outcome === "deny",
+      ),
+    ).toBe(true);
 
-    const escRow = await ledger.getAction(esc!.id);
-    expect(escRow?.status).toBe("issued");
+    const escRow = siteC.find((a) => a.kind === "escalate");
+    expect(escRow).toBeDefined();
+    expect(escRow!.status).toBe("issued");
+    expect(escRow!.decidedBy).toBe(GOVERNOR_AUTO_PRINCIPAL);
+
+    // Full offline-equivalent outcomes still hold after live + reconcile.
+    const siteA = (await ledger.listActions({ siteId: "site_a" })).filter(
+      (a) => a.sweepId === result.sweep.id,
+    );
+    expect(siteA.find((a) => a.kind === "load_shift")?.status).toBe(
+      "awaiting_approval",
+    );
+    expect(siteA.find((a) => a.kind === "load_shift")?.rmImpact).toBe(
+      SITE_A_RM_IMPACT,
+    );
   });
 });
 

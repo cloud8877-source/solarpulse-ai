@@ -14,6 +14,7 @@ import type { ActionLedger } from "../data/ledger";
 import {
   sweepId,
   type ActionCommitment,
+  type ActionStatus,
   type SweepRun,
 } from "../domain/actions";
 import {
@@ -53,20 +54,37 @@ export interface SweepResult {
   }>;
 }
 
+/** Open (non-terminal) statuses — always dedupe against these. */
+const OPEN_STATUSES: ReadonlySet<ActionStatus> = new Set([
+  "proposed",
+  "awaiting_approval",
+  "approved",
+  "issued",
+]);
+
 /**
  * Dedupe key: site + kind + deadline.
- * Skip when any prior row exists — including terminal denied/issued — so a
- * second sweep the same day creates zero new rows (acceptance).
- * (Contract also mentions non-terminal opens; we treat any prior row as taken.)
+ * - Open rows (proposed/awaiting_approval/approved/issued) always block.
+ * - denied_by_policy / expired block ONLY when their creation asOfDate equals
+ *   the current sweep's asOfDate — so a transient data_issue denial on 06-21
+ *   does not block load_shift for the rest of June once telemetry recovers.
  */
 async function hasDuplicate(
   ledger: ActionLedger,
   siteId: string,
   kind: ActionCandidate["kind"],
   deadline: string,
+  asOfDate: string,
 ): Promise<boolean> {
   const rows = await ledger.listActions({ siteId });
-  return rows.some((r) => r.kind === kind && r.deadline === deadline);
+  return rows.some((r) => {
+    if (r.kind !== kind || r.deadline !== deadline) return false;
+    if (OPEN_STATUSES.has(r.status)) return true;
+    if (r.status === "denied_by_policy" || r.status === "expired") {
+      return r.createdAt.slice(0, 10) === asOfDate;
+    }
+    return false;
+  });
 }
 
 async function recordCandidateOffline(
@@ -98,14 +116,12 @@ async function recordCandidateOffline(
     });
   }
 
-  await svc.requestApproval(proposed.id, { policyDecisions: gov.decisions });
+  const awaiting = await svc.requestApproval(proposed.id, {
+    policyDecisions: gov.decisions,
+  });
 
   if (gov.status === "user-approval") {
-    const row = await svc.getLedger().getAction(proposed.id);
-    if (!row) {
-      throw new Error(`missing action after requestApproval: ${proposed.id}`);
-    }
-    return row;
+    return awaiting;
   }
 
   // approved (auto escalate): awaiting_approval → approved(system) → issued
@@ -115,6 +131,22 @@ async function recordCandidateOffline(
     policyDecisions: gov.decisions,
   });
   return svc.issueAction(proposed.id);
+}
+
+/**
+ * Seed non-escalate counter from ledger rows already committed this sweep+site
+ * (I5-6). Count non-escalate, non-denied rows so rate_limit matches live-loop
+ * accepts and cannot re-allow a rate-limited candidate at reconciliation.
+ */
+async function nonEscalateCommittedThisSweep(
+  ledger: ActionLedger,
+  siteId: string,
+  sweepId: string,
+): Promise<number> {
+  const rows = await ledger.listActions({ siteId, sweepId });
+  return rows.filter(
+    (r) => r.kind !== "escalate" && r.status !== "denied_by_policy",
+  ).length;
 }
 
 const SWEEP_INSTRUCTIONS = `You are the KREDIT credit-clock sweep agent for SolarPulse.
@@ -136,12 +168,13 @@ WORKFLOW:
  * Run a KREDIT sweep over all sites.
  * Offline = deterministic governor path (no LLM).
  * Live = ToolLoopAgent with toolApproval → governor; denied feeds back into the loop.
+ * After the live loop (success or failure), reconciliation evaluates every
+ * uncommitted candidate so denials land on the ledger (I5-2).
  */
 export async function runSweep(opts: RunSweepOptions = {}): Promise<SweepResult> {
+  // Ledger is explicit: never pulled off the service (I5-1 removed getLedger).
   const ledger =
-    opts.ledger ??
-    opts.svc?.getLedger() ??
-    (await import("../data/ledger")).getLedger();
+    opts.ledger ?? (await import("../data/ledger")).getLedger();
   const svc =
     opts.svc ??
     createSolarOpsService(undefined, { ledger });
@@ -213,10 +246,10 @@ export async function runSweep(opts: RunSweepOptions = {}): Promise<SweepResult>
     // Stamp sweep id on all candidates.
     candidates = candidates.map((c) => ({ ...c, sweepId: thisSweepId }));
 
-    // Dedupe: skip site+kind+deadline that already has a non-terminal row.
+    // Dedupe: open rows always; denied/expired only same asOfDate (I5-3).
     const kept: ActionCandidate[] = [];
     for (const c of candidates) {
-      if (await hasDuplicate(ledger, c.siteId, c.kind, c.deadline)) {
+      if (await hasDuplicate(ledger, c.siteId, c.kind, c.deadline, asOfDate)) {
         siteNotes.push(`dedupe skip ${c.kind} deadline=${c.deadline}`);
         continue;
       }
@@ -281,6 +314,8 @@ export async function runSweep(opts: RunSweepOptions = {}): Promise<SweepResult>
     }
   } else {
     // LIVE path: ToolLoopAgent with toolApproval → governor.
+    // toolApproval is persistence-free (I5-2): denials are written only by
+    // reconciliation so a model retrying a denied candidate 3x creates 1 row.
     const actionTools = createActionTools({
       svc,
       getCandidate: (id) => candidatesById.get(id),
@@ -381,37 +416,48 @@ export async function runSweep(opts: RunSweepOptions = {}): Promise<SweepResult>
       const sweepRows = await ledger.listActions({ sweepId: thisSweepId });
       for (const r of sweepRows) {
         if (!actionIds.includes(r.id)) actionIds.push(r.id);
-        if (r.status === "denied_by_policy") blockedActions += 1;
-        else proposedActions += 1;
       }
-      // De-dupe counts (ledger scan may double-count).
       proposedActions = sweepRows.filter((r) => r.status !== "denied_by_policy").length;
       blockedActions = sweepRows.filter((r) => r.status === "denied_by_policy").length;
       notes.push(`live_steps=${result.steps?.length ?? 0}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       notes.push(`live_agent_failed: ${message}`);
-      // Fall back to offline recording for remaining uncommitted candidates.
-      notes.push("fallback=offline_for_uncommitted");
-      for (const plan of plans) {
-        let nonEscalate = 0;
-        for (const candidate of plan.candidates) {
-          const existing = await ledger.getAction(candidate.id);
-          if (existing) continue;
-          const gctx: GovernorContext = {
-            siteEligible: plan.eligible,
-            severity: plan.severity as GovernorContext["severity"],
-            knownEvidenceRefs: plan.knownEvidence,
-            nonEscalateCountThisSweep: nonEscalate,
-          };
-          const gov = evaluate(candidate, gctx);
-          const row = await recordCandidateOffline(svc, candidate, gov, now);
-          actionIds.push(row.id);
-          if (gov.status === "denied") blockedActions += 1;
-          else {
-            proposedActions += 1;
-            if (candidate.kind !== "escalate") nonEscalate += 1;
-          }
+    }
+
+    // I5-2 + I5-6: reconciliation runs UNCONDITIONALLY after the live loop
+    // (success or failure). Single writer for denials — every refusal on record,
+    // including candidates the model never attempted. Seed nonEscalate from the
+    // ledger so in-loop rate_limit denials cannot be re-allowed here.
+    notes.push("reconcile=governor_for_uncommitted");
+    for (const plan of plans) {
+      let nonEscalate = await nonEscalateCommittedThisSweep(
+        ledger,
+        plan.siteId,
+        thisSweepId,
+      );
+      for (const candidate of plan.candidates) {
+        const existing = await ledger.getAction(candidate.id);
+        if (existing) continue;
+        const gctx: GovernorContext = {
+          siteEligible: plan.eligible,
+          severity: plan.severity as GovernorContext["severity"],
+          knownEvidenceRefs: plan.knownEvidence,
+          nonEscalateCountThisSweep: nonEscalate,
+        };
+        const gov = evaluate(candidate, gctx);
+        decisionsById.set(candidate.id, gov.decisions);
+        const row = await recordCandidateOffline(svc, candidate, gov, now);
+        actionIds.push(row.id);
+        if (gov.status === "denied") {
+          blockedActions += 1;
+          plan.notes.push(
+            `${candidate.kind} DENIED (${gov.decisions[gov.decisions.length - 1]?.policyId})`,
+          );
+        } else {
+          proposedActions += 1;
+          if (candidate.kind !== "escalate") nonEscalate += 1;
+          plan.notes.push(`${candidate.kind} → ${row.status}`);
         }
       }
     }

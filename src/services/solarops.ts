@@ -145,6 +145,36 @@ export type ProposeActionInput = {
   createdAt?: string;
 };
 
+/**
+ * Narrow action surface for tool/agent code (I5-1 / C2).
+ * Deliberately excludes the raw ledger handle so model-adjacent layers cannot
+ * call transitionAction with a model-authored decidedBy.
+ */
+export interface ActionVerbs {
+  proposeAction(input: ProposeActionInput): Promise<ActionCommitment>;
+  requestApproval(
+    id: string,
+    meta?: { policyDecisions?: PolicyDecision[] },
+  ): Promise<ActionCommitment>;
+  denyByPolicy(
+    id: string,
+    meta: { policyDecisions: PolicyDecision[]; decidedAt?: string },
+  ): Promise<ActionCommitment>;
+  approveAction(
+    id: string,
+    opts: {
+      decidedBy: string;
+      decidedAt?: string;
+      policyDecisions?: PolicyDecision[];
+    },
+  ): Promise<ActionCommitment>;
+  issueAction(id: string): Promise<ActionCommitment>;
+  verifyAction(
+    id: string,
+    verification: ActionVerification,
+  ): Promise<ActionCommitment>;
+}
+
 function mapLedgerError(err: unknown): never {
   if (err instanceof SolarOpsError) throw err;
   if (err instanceof LedgerError) {
@@ -1042,7 +1072,7 @@ export function createSolarOpsService(
     }
     throw new SolarOpsError(
       "ledger_error",
-      `proposeAction exhausted ${maxRetries} retries for site '${input.siteId}' deadline '${dateKey}' (already_exists)`,
+      `proposeAction exhausted ${maxRetries} retries for site '${input.siteId}' deadline '${idDateKey}' (already_exists)`,
     );
   }
 
@@ -1325,8 +1355,8 @@ export function createSolarOpsService(
     mergeLiveWeather: mergeWeatherPreferFixture,
     /** Exposed for tests: resolves default asOfDate from fixture observations. */
     latestFixtureDate,
-    /** Exposed for tests / sweep: the ledger handle this service wraps (do not use from tools). */
-    getLedger: ledger,
+    // getLedger intentionally NOT exported (I5-1): tool/agent layers receive
+    // ActionVerbs only; runSweep takes opts.ledger explicitly.
   };
 }
 

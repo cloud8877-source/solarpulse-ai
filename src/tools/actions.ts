@@ -8,7 +8,7 @@ import {
   GOVERNOR_AUTO_PRINCIPAL,
   SolarOpsError,
   type ActionCandidate,
-  type SolarOpsService,
+  type ActionVerbs,
 } from "../services/solarops";
 import type { PolicyDecision } from "../domain/actions";
 
@@ -35,7 +35,8 @@ export const escalateInputSchema = z.object({
 });
 
 export interface ActionToolContext {
-  svc: SolarOpsService;
+  /** Narrow action verbs only — never a raw ledger (I5-1 / C2). */
+  svc: ActionVerbs;
   /** Lookup a pre-generated deterministic candidate by id. */
   getCandidate: (id: string) => ActionCandidate | undefined;
   /** All candidates for a site (used by escalate to select the escalate candidate). */
