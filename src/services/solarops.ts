@@ -4,6 +4,11 @@
 // (PDR-005 §6). No LLM is involved in any calculation here (ADR-0005).
 
 import { assumptions, MODEL_VERSION } from "../config/assumptions";
+import {
+  fetchLiveWeather,
+  mergeWeatherPreferFixture,
+  type FetchLiveWeatherOpts,
+} from "../data/liveWeather";
 import { buildSourceManifest, FIXTURE_INPUTS, STANDARD_ASSUMPTIONS } from "../data/sourceManifest";
 import { getStore, type SolarStore } from "../data/store";
 import { billingPeriodBounds, computeAtapCreditClock } from "../engine/atap";
@@ -24,8 +29,24 @@ import type {
   ReportFormat,
   RootCauseResult,
   Severity,
+  Site,
   Weather,
 } from "../domain/types";
+
+/** Injectable live-weather fetcher (tests pass a stub or null — never hits the network). */
+export type LiveWeatherFetcher = (
+  site: Site,
+  opts?: FetchLiveWeatherOpts,
+) => Promise<Weather[] | null>;
+
+export type SolarOpsServiceOptions = {
+  /**
+   * Live Open-Meteo fetcher. Defaults to the real `fetchLiveWeather`.
+   * Pass `null` to disable (CI / offline). Only invoked from the opt-in
+   * `getWeatherMerged` path when `now` marks asOfDate as "today".
+   */
+  liveWeatherFetcher?: LiveWeatherFetcher | null;
+};
 
 const REFERENCE_SITE_ID = "site_a"; // healthy reference for the model backtest WAPE
 /** Local calendar used for all detection windows (Peninsular Malaysia). */
@@ -190,10 +211,20 @@ function eventToRootCause(ev: AnomalyEvent): RootCauseResult {
   };
 }
 
-export function createSolarOpsService(store: SolarStore = getStore()) {
+export function createSolarOpsService(
+  store: SolarStore = getStore(),
+  options: SolarOpsServiceOptions = {},
+) {
   // Day-scoped reference WAPE (key = YYYY-MM-DD); value null means unmeasurable that day.
   const referenceWapeCache = new Map<string, number | null>();
   let latestFixtureDateCache: string | null | undefined;
+
+  // Default = real Open-Meteo fetcher; explicit null disables. Existing sync methods
+  // never call this — only getWeatherMerged with a passed-in `now` can trigger a fetch.
+  const liveWeatherFetcher: LiveWeatherFetcher | null =
+    options.liveWeatherFetcher === undefined
+      ? fetchLiveWeather
+      : options.liveWeatherFetcher;
 
   /** Latest ISO date (YYYY-MM-DD) present in fixture observations; demo default asOfDate. */
   function latestFixtureDate(): string {
@@ -814,6 +845,50 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     };
   }
 
+  /**
+   * Opt-in weather resolution with optional live Open-Meteo overlay.
+   *
+   * Live fetch runs ONLY when all of:
+   *   - a non-null liveWeatherFetcher is configured
+   *   - `now` is provided (never uses Date.now() — keeps tests deterministic / offline)
+   *   - asOfDate (resolved) equals the local (+08) calendar day of `now`
+   *
+   * Fixture rows always win on hour collision; live only ADDS uncovered hours.
+   * On any fetch failure, returns fixture weather unchanged (never throws).
+   */
+  async function getWeatherMerged(
+    siteId: string,
+    asOfDate?: string,
+    opts?: { now?: string; pastDays?: number },
+  ): Promise<Weather[]> {
+    const site = requireSite(siteId);
+    const day = resolveAsOfDate(asOfDate);
+    const fixture = store.getWeather(siteId);
+
+    const fetcher = liveWeatherFetcher;
+    const shouldFetchLive =
+      fetcher != null && opts?.now != null && localDateKey(opts.now) === day;
+
+    if (!shouldFetchLive || fetcher == null) {
+      return filterByDate(fixture, day);
+    }
+
+    let live: Weather[] | null = null;
+    try {
+      live = await fetcher(site, {
+        ...(opts?.pastDays != null ? { pastDays: opts.pastDays } : {}),
+      });
+    } catch {
+      live = null;
+    }
+
+    if (!live || live.length === 0) {
+      return filterByDate(fixture, day);
+    }
+
+    return filterByDate(mergeWeatherPreferFixture(fixture, live), day);
+  }
+
   return {
     listSites,
     portfolioSummary,
@@ -827,6 +902,10 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     generateSolarReport,
     generateGreenPerformanceReport,
     atapCreditClock,
+    /** Opt-in live+fixture weather merge (async; off the default hot path). */
+    getWeatherMerged,
+    /** Pure merge helper — fixture wins; live fills gaps. No I/O. */
+    mergeLiveWeather: mergeWeatherPreferFixture,
     /** Exposed for tests: resolves default asOfDate from fixture observations. */
     latestFixtureDate,
   };
