@@ -1,4 +1,4 @@
-id,tenant_id,name,region,latitude,longitude,capacity_kwp,inverter_count,commissioning_date,tariff_assumption_rm_per_kwh,carbon_factor_kgco2_per_kwh,performance_ratio,source,is_fixture
-site_a,maic-solarpulse-demo,Klang Valley C&I Rooftop,Selangor,3.0738,101.5183,850,6,2024-04-01,0.2703,0.652,0.78,demo_fixture,True
-site_b,maic-solarpulse-demo,Northern Solar Farm,Kedah,5.68,100.48,2500,12,2023-11-15,0.2983,0.652,0.78,demo_fixture,True
-site_c,maic-solarpulse-demo,Penang Industrial Rooftop,Penang,5.4141,100.3288,950,8,2025-01-10,0.2703,0.652,0.78,demo_fixture,True
+id,tenant_id,name,region,latitude,longitude,capacity_kwp,inverter_count,commissioning_date,tariff_assumption_rm_per_kwh,carbon_factor_kgco2_per_kwh,performance_ratio,tariff_category,source,is_fixture
+site_a,maic-solarpulse-demo,Klang Valley C&I Rooftop,Selangor,3.0738,101.5183,850,6,2024-04-01,0.2703,0.652,0.78,lv_general,demo_fixture,True
+site_b,maic-solarpulse-demo,Northern Solar Farm,Kedah,5.68,100.48,2500,12,2023-11-15,0.2983,0.652,0.78,mv_general,demo_fixture,True
+site_c,maic-solarpulse-demo,Penang Industrial Rooftop,Penang,5.4141,100.3288,950,8,2025-01-10,0.2703,0.652,0.78,lv_general,demo_fixture,True

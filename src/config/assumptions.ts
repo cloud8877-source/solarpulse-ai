@@ -24,6 +24,16 @@ export const assumptions = {
   // is excluded from this model (GP/ST/No.60/2025 Pricing and Tariff).
   retailTariffRmPerKwh: 0.2703,
 
+  // TNB non-domestic LV General unbundled volumetric components, effective 1 Jul 2025
+  // (Source: https://www.mytnb.com.my/tariff). Sum = 0.5068 RM/kWh full avoided-cost stack
+  // used for self-consumption valuation / SMP-spread leak. MV capacity & network are
+  // RM/kW demand charges (not volumetric), so MV volumetric = energy charge 0.2983 only.
+  lvVolumetricComponents: {
+    energyRmPerKwh: 0.2703,
+    capacityRmPerKwh: 0.0883,
+    networkRmPerKwh: 0.1482,
+  },
+
   // Peninsular Malaysia Grid Emission Factor projection for 2026 (JPPET 2/2025 basis),
   // published 31 Dec 2025 (month: 2025-12).
   // Source: https://singlebuyer.com.my/docs/default-source/about/gef-projection-publication_31122025v1.pdf
