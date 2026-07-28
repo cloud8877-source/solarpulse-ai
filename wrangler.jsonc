@@ -6,4 +6,17 @@
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "assets": { "directory": ".open-next/assets", "binding": "ASSETS" },
   "services": [{ "binding": "WORKER_SELF_REFERENCE", "service": "solarpulse" }]
+  // KREDIT action ledger (D1). Keep commented until the DB exists so deploys stay green.
+  // Setup:
+  //   1. run: wrangler d1 create kredit-ledger
+  //   2. paste the returned database_id below
+  //   3. uncomment the d1_databases block
+  // , "d1_databases": [
+  //   {
+  //     "binding": "KREDIT_LEDGER",
+  //     "database_name": "kredit-ledger",
+  //     "database_id": "PASTE_DATABASE_ID_HERE",
+  //     "migrations_dir": "migrations"
+  //   }
+  // ]
 }
