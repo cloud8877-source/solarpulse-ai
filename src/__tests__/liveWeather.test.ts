@@ -151,6 +151,31 @@ describe("fetchLiveWeather (Open-Meteo)", () => {
     ).resolves.toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  // N7+N8: Malaysia-only offset guard — non-+08 responses must not produce rows
+  // that silently fail string-key matching in the engine.
+  it("returns null when utc_offset_seconds is not +08:00 (28800)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.stubGlobal("fetch", mockFetchOk(openMeteoBody({ utc_offset_seconds: 0 })));
+    await expect(fetchLiveWeather(baseSite())).resolves.toBeNull();
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it("returns null when a normalized timestamp has Z suffix (not +08:00)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.stubGlobal(
+      "fetch",
+      mockFetchOk(
+        openMeteoBody({
+          hourly: {
+            time: ["2026-07-28T00:00:00Z", "2026-07-28T12:00:00Z"],
+          },
+        }),
+      ),
+    );
+    await expect(fetchLiveWeather(baseSite())).resolves.toBeNull();
+    expect(warn).toHaveBeenCalled();
+  });
 });
 
 describe("mergeWeatherPreferFixture", () => {
@@ -201,9 +226,58 @@ describe("mergeWeatherPreferFixture", () => {
     expect(liveAdded[0]!.timestamp).toBe("2026-07-28T12:00:00+08:00");
     expect(liveAdded[0]!.isFixture).toBe(false);
   });
+
+  // N10c: two live rows same hour-key → one addition (first wins).
+  it("dedupes live rows that share the same hour key (keeps first)", () => {
+    const live: Weather[] = [
+      {
+        id: "live_a",
+        siteId: "site_a",
+        timestamp: "2026-07-28T12:00:00+08:00",
+        irradianceWm2: 700,
+        temperatureC: 30,
+        cloudCover: 0.5,
+        rainfallMm: null,
+        source: "open-meteo",
+        isFixture: false,
+        qualityFlags: [],
+      },
+      {
+        id: "live_b",
+        siteId: "site_a",
+        // same hour key (YYYY-MM-DDTHH = 2026-07-28T12) as live_a
+        timestamp: "2026-07-28T12:30:00+08:00",
+        irradianceWm2: 999,
+        temperatureC: 31,
+        cloudCover: 0.6,
+        rainfallMm: null,
+        source: "open-meteo",
+        isFixture: false,
+        qualityFlags: [],
+      },
+    ];
+    const merged = mergeWeatherPreferFixture([], live);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.id).toBe("live_a");
+    expect(merged[0]!.irradianceWm2).toBe(700);
+  });
 });
 
 describe("SolarOps getWeatherMerged (opt-in live path)", () => {
+  // N9: suite-level guard — default construction is fail-closed (no network).
+  it("default-constructed service never triggers network fetch", async () => {
+    const spy = vi.fn(() => {
+      throw new Error("fetch must not be called on default SolarOpsService");
+    });
+    vi.stubGlobal("fetch", spy);
+    // No liveWeatherFetcher option → must default to null, not the real fetcher.
+    const svc = createSolarOpsService(new InMemoryStore());
+    await svc.getWeatherMerged("site_a", "2026-07-28", {
+      now: "2026-07-28T12:00:00+08:00",
+    });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
   it("does not call the fetcher when now is omitted (default hot path stays offline)", async () => {
     const fetcher = vi.fn().mockResolvedValue([]);
     const svc = createSolarOpsService(new InMemoryStore(), {
@@ -275,18 +349,46 @@ describe("SolarOps getWeatherMerged (opt-in live path)", () => {
     ).toBe(fixtureBefore.filter((w) => w.timestamp.startsWith("2026-06-")).length);
   });
 
-  it("falls back to fixture-only when fetcher returns null", async () => {
+  // N10b: null fetcher → fixture-only for both empty day and demo day with real rows.
+  it("falls back to fixture-only when fetcher returns null (empty day and demo day)", async () => {
     const fetcher = vi.fn().mockResolvedValue(null);
-    const svc = createSolarOpsService(new InMemoryStore(), {
-      liveWeatherFetcher: fetcher,
+    const store = new InMemoryStore();
+    const svc = createSolarOpsService(store, { liveWeatherFetcher: fetcher });
+
+    // Empty day (no fixture coverage for "today") → empty array after filter.
+    const empty = await svc.getWeatherMerged("site_a", "2026-07-28", {
+      now: "2026-07-28T12:00:00+08:00",
     });
-    // Use a fixture day that matches "today" so fetch is attempted, then null → empty day.
-    // asOfDate = today with no fixture coverage → empty array after filter.
-    const rows = await svc.getWeatherMerged("site_a", "2026-07-28", {
+    expect(empty).toEqual([]);
+
+    // Demo day with genuine fixture rows — must return them, not empty.
+    const demo = await svc.getWeatherMerged("site_a", "2026-06-21", {
+      now: "2026-06-21T12:00:00+08:00",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(demo.length).toBeGreaterThan(0);
+    expect(demo.every((w) => w.isFixture)).toBe(true);
+  });
+
+  // N10a: throwing fetcher must not propagate — try/catch returns fixture-only.
+  it("survives a throwing fetcher and returns fixture-only", async () => {
+    const fetcher = vi.fn().mockRejectedValue(new Error("boom"));
+    const store = new InMemoryStore();
+    const svc = createSolarOpsService(store, { liveWeatherFetcher: fetcher });
+
+    // Empty day (no fixture coverage)
+    const empty = await svc.getWeatherMerged("site_a", "2026-07-28", {
       now: "2026-07-28T12:00:00+08:00",
     });
     expect(fetcher).toHaveBeenCalled();
-    expect(rows).toEqual([]);
+    expect(empty).toEqual([]);
+
+    // Demo day still returns fixture rows after throw
+    const demo = await svc.getWeatherMerged("site_a", "2026-06-21", {
+      now: "2026-06-21T12:00:00+08:00",
+    });
+    expect(demo.length).toBeGreaterThan(0);
+    expect(demo.every((w) => w.isFixture)).toBe(true);
   });
 
   it("null liveWeatherFetcher never fetches even when now marks today", async () => {

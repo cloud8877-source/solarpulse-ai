@@ -5,7 +5,6 @@
 
 import { assumptions, MODEL_VERSION } from "../config/assumptions";
 import {
-  fetchLiveWeather,
   mergeWeatherPreferFixture,
   type FetchLiveWeatherOpts,
 } from "../data/liveWeather";
@@ -33,6 +32,13 @@ import type {
   Weather,
 } from "../domain/types";
 
+/**
+ * Real Open-Meteo fetcher — opt in at app wiring (I7):
+ *   createSolarOpsService(store, { liveWeatherFetcher: fetchLiveWeather })
+ * Default is null (fail-closed); never auto-wired into createSolarOpsService.
+ */
+export { fetchLiveWeather } from "../data/liveWeather";
+
 /** Injectable live-weather fetcher (tests pass a stub or null — never hits the network). */
 export type LiveWeatherFetcher = (
   site: Site,
@@ -41,9 +47,10 @@ export type LiveWeatherFetcher = (
 
 export type SolarOpsServiceOptions = {
   /**
-   * Live Open-Meteo fetcher. Defaults to the real `fetchLiveWeather`.
-   * Pass `null` to disable (CI / offline). Only invoked from the opt-in
-   * `getWeatherMerged` path when `now` marks asOfDate as "today".
+   * Live Open-Meteo fetcher. Defaults to `null` (fail-closed — no network).
+   * Opt in at app wiring (I7) with `liveWeatherFetcher: fetchLiveWeather`.
+   * Only invoked from the opt-in `getWeatherMerged` path when `now` marks
+   * asOfDate as "today".
    */
   liveWeatherFetcher?: LiveWeatherFetcher | null;
 };
@@ -219,11 +226,12 @@ export function createSolarOpsService(
   const referenceWapeCache = new Map<string, number | null>();
   let latestFixtureDateCache: string | null | undefined;
 
-  // Default = real Open-Meteo fetcher; explicit null disables. Existing sync methods
-  // never call this — only getWeatherMerged with a passed-in `now` can trigger a fetch.
+  // Default = null (fail-closed). Opt in with fetchLiveWeather at app wiring (I7).
+  // Existing sync methods never call this — only getWeatherMerged with a
+  // passed-in `now` AND a non-null fetcher can trigger a fetch.
   const liveWeatherFetcher: LiveWeatherFetcher | null =
     options.liveWeatherFetcher === undefined
-      ? fetchLiveWeather
+      ? null
       : options.liveWeatherFetcher;
 
   /** Latest ISO date (YYYY-MM-DD) present in fixture observations; demo default asOfDate. */

@@ -1,12 +1,21 @@
 // Live Open-Meteo irradiance/weather overlay for SolarPulse.
 // Fixture weather remains the demo spine; this module only ADDS rows for hours
 // not already covered by fixtures. Never throws — any failure returns null.
+//
+// Malaysia-only coupling: the engine compares timestamps as +08:00 strings
+// (LOCAL_OFFSET, filterByDate, timestamp-keyed maps). We pin
+// timezone=Asia/Kuala_Lumpur on the request and REJECT any response whose
+// utc_offset_seconds is not 28800 or whose normalized timestamps do not end
+// in +08:00 — a non-+08 / Z-suffixed row would silently match nothing.
 
 import type { Site, Weather } from "../domain/types";
 
 const OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast";
 /** Fixture cloud_cover is 0–1 (see weather_observations.csv: 0.2 / 0.35 / 0.65). */
 const OPEN_METEO_CLOUD_SCALE = 100;
+/** Asia/Kuala_Lumpur fixed offset — engine is +08:00 string-comparison only. */
+const MALAYSIA_OFFSET_SECONDS = 28800;
+const MALAYSIA_OFFSET_SUFFIX = "+08:00";
 
 export type FetchLiveWeatherOpts = {
   /** Recent history days (Open-Meteo past_days, 0–92). Default 0. */
@@ -63,6 +72,7 @@ export async function fetchLiveWeather(
 /**
  * Merge live rows into fixture weather. Fixture timestamps always win —
  * live only fills hours not already covered (demo days 2026-06-18..21 stay intact).
+ * Within live additions, hour keys are deduped (first wins).
  * Does not mutate either input. Result is sorted by timestamp.
  */
 export function mergeWeatherPreferFixture(
@@ -71,7 +81,13 @@ export function mergeWeatherPreferFixture(
 ): Weather[] {
   const hourKey = (ts: string) => ts.slice(0, 13); // YYYY-MM-DDTHH
   const covered = new Set(fixture.map((w) => hourKey(w.timestamp)));
-  const additions = live.filter((w) => !covered.has(hourKey(w.timestamp)));
+  const additions: Weather[] = [];
+  for (const w of live) {
+    const key = hourKey(w.timestamp);
+    if (covered.has(key)) continue;
+    covered.add(key); // dedupe within live: same hour appears once
+    additions.push(w);
+  }
   if (additions.length === 0) return [...fixture];
   return [...fixture, ...additions].sort((a, b) =>
     a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0,
@@ -106,22 +122,32 @@ function mapOpenMeteoToWeather(
     return null;
   }
 
+  // Malaysia-only: engine string-compares +08:00 timestamps. Reject any other
+  // offset so rows cannot silently fail to match filterByDate / hour maps.
+  if (body.utc_offset_seconds !== MALAYSIA_OFFSET_SECONDS) {
+    console.warn(
+      `[liveWeather] rejecting Open-Meteo response: utc_offset_seconds=${String(body.utc_offset_seconds)} (require ${MALAYSIA_OFFSET_SECONDS} / Asia/Kuala_Lumpur)`,
+    );
+    return null;
+  }
+
   const times = hourly.time;
   const sw = asNumberArray(hourly.shortwave_radiation, times.length);
   const temp = asNumberArray(hourly.temperature_2m, times.length);
   const cloud = asNumberArray(hourly.cloud_cover, times.length);
   if (!sw || !temp || !cloud) return null;
 
-  const offsetSec =
-    typeof body.utc_offset_seconds === "number"
-      ? body.utc_offset_seconds
-      : 8 * 60 * 60;
-
   const out: Weather[] = [];
   for (let i = 0; i < times.length; i++) {
     const raw = times[i];
     if (typeof raw !== "string" || raw.length < 13) return null;
-    const timestamp = normalizeLocalTimestamp(raw, offsetSec);
+    const timestamp = normalizeLocalTimestamp(raw, MALAYSIA_OFFSET_SECONDS);
+    if (!timestamp.endsWith(MALAYSIA_OFFSET_SUFFIX)) {
+      console.warn(
+        `[liveWeather] rejecting Open-Meteo response: timestamp '${timestamp}' is not ${MALAYSIA_OFFSET_SUFFIX} (Malaysia-only engine)`,
+      );
+      return null;
+    }
     // id: live_<siteId>_<YYYYMMDDHH> from wall-clock hour
     const hourTag = timestamp.slice(0, 13).replace(/[-T:]/g, "");
     out.push({
