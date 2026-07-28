@@ -1,16 +1,69 @@
 // Central config for every tunable number in the engine.
 // PDR-004 §3: "Thresholds should be config values, not hardcoded deep inside logic."
-// Financial/carbon values are demo-only configurable assumptions, NOT quoted tariffs.
+// Financial/carbon values are demo-only configurable assumptions, NOT quoted tariffs —
+// except where a public gazette / published tariff is cited in the comment below.
 
-import type { Confidence, Severity } from "../domain/types";
+import type { Confidence, Severity, SourceType } from "../domain/types";
 
 export const MODEL_VERSION = "solarops-baseline-v1";
 export const BASELINE_VERSION = "solarops-baseline-v1";
 
+/** One month's Average SMP entry used for ATAP export credit pricing. */
+export interface AverageSmpEntry {
+  rmPerKwh: number;
+  /** Provenance label for the SourceManifest (public | manual_assumption | …). */
+  provenance: SourceType;
+  source: string;
+}
+
 export const assumptions = {
-  // --- Financial / carbon (demo-only; surfaced in every recommendation & report) ---
-  tariffRmPerKwh: 0.5,
-  carbonFactorKgco2PerKwh: 0.65,
+  // --- Financial / carbon ---
+  // TNB Non-Domestic Low Voltage General energy charge, effective 1 Jul 2025
+  // (month: 2025-07). Source: https://www.mytnb.com.my/tariff
+  // Note: ATAP credits offset the energy charge only — AFA (Automatic Fuel Adjustment)
+  // is excluded from this model (GP/ST/No.60/2025 Pricing and Tariff).
+  retailTariffRmPerKwh: 0.2703,
+
+  // Peninsular Malaysia Grid Emission Factor projection for 2026 (JPPET 2/2025 basis),
+  // published 31 Dec 2025 (month: 2025-12).
+  // Source: https://singlebuyer.com.my/docs/default-source/about/gef-projection-publication_31122025v1.pdf
+  carbonFactorKgco2PerKwh: 0.652,
+
+  // --- Solar ATAP (GP/ST/No.60/2025, effective 1 Jan 2026, Peninsular Malaysia) ---
+  // Gazette: https://www.st.gov.my/sites/default/files/2026-03/GUIDELINES-FOR-SOLAR-ACCELERATED_0.pdf
+  // Average SMP = monthly average System Marginal Price for 07:00–19:00 of the
+  // PRECEDING calendar month (section 2 definition) — known at billing-period start.
+  atap: {
+    averageSmpByMonth: {
+      // Single Buyer revised SMP series, retrieved 2026-07-28 (month: 2026-01).
+      "2026-01": {
+        rmPerKwh: 0.1911,
+        provenance: "public" as SourceType,
+        source:
+          "https://www.singlebuyer.com.my/market/market-data/system-marginal-price (revised, retrieved 2026-07-28)",
+      },
+      // Single Buyer revised SMP series, retrieved 2026-07-28 (month: 2026-02).
+      "2026-02": {
+        rmPerKwh: 0.1893,
+        provenance: "public" as SourceType,
+        source:
+          "https://www.singlebuyer.com.my/market/market-data/system-marginal-price (revised, retrieved 2026-07-28)",
+      },
+      // Placeholder until May 2026 publication is verified (month: 2026-05).
+      "2026-05": {
+        rmPerKwh: 0.1893,
+        provenance: "manual_assumption" as SourceType,
+        source:
+          "placeholder = most recent verified month (Feb 2026); May 2026 publication pending manual check",
+      },
+    } satisfies Record<string, AverageSmpEntry>,
+    // Gazette section 2 MAQ definition: capacity (kWac) × sun-hours × days in period.
+    sunHoursPerDay: 5,
+    // Non-domestic hard cap (GP/ST/No.60/2025 eligibility).
+    nonDomesticCapKwac: 1000,
+    // Our capacity fields are kWp — used as a proxy for kWac (stated assumption).
+    kwpAsKwacProxy: true,
+  },
 
   // --- Forecast baseline (PDR-004 §2) ---
   performanceRatioDefault: 0.78,

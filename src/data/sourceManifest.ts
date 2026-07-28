@@ -38,13 +38,13 @@ export const FIXTURE_INPUTS: Record<string, ManifestInput> = {
 export const STANDARD_ASSUMPTIONS: Assumption[] = [
   {
     name: "tariff_assumption_rm_per_kwh",
-    value: assumptions.tariffRmPerKwh,
-    note: "Demo-only configurable assumption; not a quoted tariff.",
+    value: assumptions.retailTariffRmPerKwh,
+    note: "TNB Non-Domestic LV General energy charge (public); AFA excluded from ATAP model.",
   },
   {
     name: "carbon_factor_kgco2_per_kwh",
     value: assumptions.carbonFactorKgco2PerKwh,
-    note: "Demo-only configurable factor; replace with approved factor before production.",
+    note: "Peninsular Malaysia GEF projection 2026 (JPPET 2/2025, published 31 Dec 2025).",
   },
   {
     name: "performance_ratio",

@@ -23,8 +23,10 @@ describe("Green Performance Report (GPR)", () => {
       "| Performance index (observed / expected) | **100.2%** |",
     );
     // Literal financial / carbon figures (must catch a broken calculation).
-    expect(rep.content).toContain("**RM 2329.57**");
-    expect(rep.content).toContain("**3028.44 kg CO₂e**");
+    // 4659.14 kWh × 0.2703 RM/kWh = 1259.365542 → 1259.37
+    expect(rep.content).toContain("**RM 1259.37**");
+    // 4659.14 kWh × 0.652 kgCO₂e/kWh = 3037.75928 → 3037.76
+    expect(rep.content).toContain("**3037.76 kg CO₂e**");
     expect(rep.content).toContain("Assumptions");
     expect(rep.content).toContain("| Name | Value | Note |");
     expect(rep.content).toContain("fixture_data");
@@ -35,8 +37,8 @@ describe("Green Performance Report (GPR)", () => {
     expect(rep.data.production.observedKwh).toBe(4659.14);
     expect(rep.data.production.expectedKwh).toBe(4651.61);
     expect(rep.data.production.performanceIndexDisplay).toBe("100.2%");
-    expect(rep.data.value.rmValue).toBe(2329.57);
-    expect(rep.data.value.co2Kg).toBe(3028.44);
+    expect(rep.data.value.rmValue).toBe(1259.37); // 4659.14 kWh × 0.2703
+    expect(rep.data.value.co2Kg).toBe(3037.76); // 4659.14 kWh × 0.652
     expect(rep.data.incidents.severity).toBe("healthy");
   });
 

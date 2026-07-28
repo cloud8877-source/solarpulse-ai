@@ -253,7 +253,7 @@ export function generateGreenReport(args: GreenReportArgs): GreenReportResult {
     : "n/a";
 
   // Resolve per-site overrides (same values used in body and provenance manifest).
-  const tariff = site.tariffAssumptionRmPerKwh ?? A.tariffRmPerKwh;
+  const tariff = site.tariffAssumptionRmPerKwh ?? A.retailTariffRmPerKwh;
   const carbon = site.carbonFactorKgco2PerKwh ?? A.carbonFactorKgco2PerKwh;
   const energyValueRm = round(observedKwh * tariff);
   const co2AvoidedKg = round(observedKwh * carbon);
