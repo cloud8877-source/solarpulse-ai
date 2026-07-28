@@ -4,6 +4,7 @@
 
 import {
   actionId,
+  dateKeyCompact,
   sweepId,
   type ActionCommitment,
   type ActionStatus,
@@ -19,7 +20,10 @@ import {
 export type LedgerErrorCode =
   | "illegal_transition"
   | "not_found"
-  | "verification_not_allowed";
+  | "verification_not_allowed"
+  | "verification_already_set"
+  | "invalid_initial_status"
+  | "already_exists";
 
 export class LedgerError extends Error {
   constructor(
@@ -96,6 +100,31 @@ export function assertCanSetVerification(status: ActionStatus): void {
   }
 }
 
+/**
+ * Public create path only: proposed + no grade + no decision signature.
+ * Shared by both backends so the create boundary is identical.
+ */
+export function assertValidInitialAction(a: ActionCommitment): void {
+  if (a.status !== "proposed") {
+    throw new LedgerError(
+      "invalid_initial_status",
+      `saveAction accepts only status 'proposed' (got '${a.status}')`,
+    );
+  }
+  if (a.verification !== null) {
+    throw new LedgerError(
+      "invalid_initial_status",
+      "saveAction rejects initial actions that already carry verification",
+    );
+  }
+  if (a.decidedAt !== null || a.decidedBy !== null) {
+    throw new LedgerError(
+      "invalid_initial_status",
+      "saveAction rejects initial actions that already carry decidedAt/decidedBy",
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Interface
 // ---------------------------------------------------------------------------
@@ -117,6 +146,8 @@ export interface ActionLedger {
     meta?: TransitionMeta,
   ): Promise<ActionCommitment>;
   setVerification(id: string, v: ActionVerification): Promise<ActionCommitment>;
+  /** Max existing seq for site+day + 1 (starts at 1 when empty). */
+  nextSeq(siteId: string, dateKey: string): Promise<number>;
   saveSweep(s: SweepRun): Promise<void>;
   listSweeps(limit?: number): Promise<SweepRun[]>;
   latestSweep(): Promise<SweepRun | null>;
@@ -253,6 +284,93 @@ function shiftIsoDate(iso: string, days: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// Shared transition / verification apply (status rules only — backends write)
+// ---------------------------------------------------------------------------
+
+function applyTransition(
+  current: ActionCommitment,
+  next: ActionStatus,
+  meta?: TransitionMeta,
+): ActionCommitment {
+  assertLegalTransition(current.status, next, meta);
+
+  // L4: issue requires a non-blank signature already on the row (set at approval).
+  // Issue-time meta cannot blank or rewrite decidedBy/decidedAt.
+  if (next === "issued") {
+    const signer = current.decidedBy?.trim();
+    if (!signer) {
+      throw new LedgerError(
+        "illegal_transition",
+        "Transition to issued requires current.decidedBy (set at approval)",
+      );
+    }
+    return {
+      ...cloneAction(current),
+      status: next,
+      // deliberately ignore meta.decidedBy / meta.decidedAt
+      decidedBy: current.decidedBy,
+      decidedAt: current.decidedAt,
+      policyDecisions:
+        meta?.policyDecisions !== undefined
+          ? meta.policyDecisions.map((p) => ({ ...p }))
+          : current.policyDecisions.map((p) => ({ ...p })),
+    };
+  }
+
+  return {
+    ...cloneAction(current),
+    status: next,
+    decidedBy: meta?.decidedBy !== undefined ? meta.decidedBy : current.decidedBy,
+    decidedAt: meta?.decidedAt !== undefined ? meta.decidedAt : current.decidedAt,
+    policyDecisions:
+      meta?.policyDecisions !== undefined
+        ? meta.policyDecisions.map((p) => ({ ...p }))
+        : current.policyDecisions.map((p) => ({ ...p })),
+  };
+}
+
+function applyVerification(
+  current: ActionCommitment,
+  v: ActionVerification,
+): ActionCommitment {
+  assertCanSetVerification(current.status);
+  // L3: grades are permanent — no amend in this increment.
+  if (current.verification !== null) {
+    throw new LedgerError(
+      "verification_already_set",
+      `Verification already set on action '${current.id}' (outcome=${current.verification.outcome})`,
+    );
+  }
+  return {
+    ...cloneAction(current),
+    verification: { ...v },
+  };
+}
+
+/** Parse seq from act_<site>_<yyyymmdd>_<seq>; null if id does not match. */
+function seqFromActionId(id: string, siteId: string, dateKey: string): number | null {
+  const prefix = `act_${siteId}_${dateKeyCompact(dateKey)}_`;
+  if (!id.startsWith(prefix)) return null;
+  const rest = id.slice(prefix.length);
+  if (!/^\d+$/.test(rest)) return null;
+  return Number(rest);
+}
+
+function computeNextSeq(
+  actions: readonly ActionCommitment[],
+  siteId: string,
+  dateKey: string,
+): number {
+  let max = 0;
+  for (const a of actions) {
+    if (a.siteId !== siteId) continue;
+    const seq = seqFromActionId(a.id, siteId, dateKey);
+    if (seq !== null && seq > max) max = seq;
+  }
+  return max + 1;
+}
+
+// ---------------------------------------------------------------------------
 // In-memory implementation
 // ---------------------------------------------------------------------------
 
@@ -266,16 +384,37 @@ export class InMemoryLedger implements ActionLedger {
   private readonly sweeps = new Map<string, SweepRun>();
 
   constructor(seed: LedgerSeed = {}) {
+    // Seed path intentionally bypasses public create guards (historical fixtures).
     for (const a of seed.actions ?? []) {
-      this.actions.set(a.id, cloneAction(a));
+      this.writeAction(a);
     }
     for (const s of seed.sweeps ?? []) {
       this.sweeps.set(s.id, cloneSweep(s));
     }
   }
 
-  async saveAction(a: ActionCommitment): Promise<void> {
+  /**
+   * Private blind upsert. Used by transitions, verification, and constructor seed.
+   * NOT exported — public callers must use saveAction (create-only).
+   */
+  private writeAction(a: ActionCommitment): void {
     this.actions.set(a.id, cloneAction(a));
+  }
+
+  /**
+   * Fixture/demo seed write — not on ActionLedger.
+   * Historical issued/verified/falsified rows go through here, never saveAction.
+   */
+  async seedAction(a: ActionCommitment): Promise<void> {
+    this.writeAction(a);
+  }
+
+  async saveAction(a: ActionCommitment): Promise<void> {
+    assertValidInitialAction(a);
+    if (this.actions.has(a.id)) {
+      throw new LedgerError("already_exists", `Action '${a.id}' already exists`);
+    }
+    this.writeAction(a);
   }
 
   async getAction(id: string): Promise<ActionCommitment | null> {
@@ -310,18 +449,8 @@ export class InMemoryLedger implements ActionLedger {
     if (!current) {
       throw new LedgerError("not_found", `Unknown action '${id}'`);
     }
-    assertLegalTransition(current.status, next, meta);
-    const updated: ActionCommitment = {
-      ...cloneAction(current),
-      status: next,
-      decidedBy: meta?.decidedBy !== undefined ? meta.decidedBy : current.decidedBy,
-      decidedAt: meta?.decidedAt !== undefined ? meta.decidedAt : current.decidedAt,
-      policyDecisions:
-        meta?.policyDecisions !== undefined
-          ? meta.policyDecisions.map((p) => ({ ...p }))
-          : current.policyDecisions.map((p) => ({ ...p })),
-    };
-    this.actions.set(id, updated);
+    const updated = applyTransition(current, next, meta);
+    this.writeAction(updated);
     return cloneAction(updated);
   }
 
@@ -333,13 +462,13 @@ export class InMemoryLedger implements ActionLedger {
     if (!current) {
       throw new LedgerError("not_found", `Unknown action '${id}'`);
     }
-    assertCanSetVerification(current.status);
-    const updated: ActionCommitment = {
-      ...cloneAction(current),
-      verification: { ...v },
-    };
-    this.actions.set(id, updated);
+    const updated = applyVerification(current, v);
+    this.writeAction(updated);
     return cloneAction(updated);
+  }
+
+  async nextSeq(siteId: string, dateKey: string): Promise<number> {
+    return computeNextSeq([...this.actions.values()], siteId, dateKey);
   }
 
   async saveSweep(s: SweepRun): Promise<void> {
@@ -524,20 +653,70 @@ export function rowToSweep(row: Record<string, unknown>): SweepRun {
 // D1 implementation
 // ---------------------------------------------------------------------------
 
-const ACTION_COLS =
+/** Comma-separated column list — kept in lockstep with migrations/0001_action_ledger.sql. */
+export const ACTION_COLS =
   "id, siteId, sweepId, kind, title, description, rmImpact, kwhImpact, confidence, evidenceRefs, deadline, approvalClass, status, policyDecisions, verification, createdAt, decidedAt, decidedBy";
 
+export const SWEEP_COLS =
+  "id, asOfDate, startedAt, siteCount, proposedActions, blockedActions, notes";
+
 const ACTION_PLACEHOLDERS = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
+const SWEEP_PLACEHOLDERS = "?, ?, ?, ?, ?, ?, ?";
 
 export class D1Ledger implements ActionLedger {
   constructor(private readonly db: D1Like) {}
 
-  async saveAction(a: ActionCommitment): Promise<void> {
+  /**
+   * Private blind upsert. Used by transitions and verification.
+   * NOT exported — public callers must use saveAction (create-only).
+   */
+  private async writeAction(a: ActionCommitment): Promise<void> {
     const r = actionToRow(a);
     await this.db
       .prepare(
         `INSERT OR REPLACE INTO actions (${ACTION_COLS}) VALUES (${ACTION_PLACEHOLDERS})`,
       )
+      .bind(
+        r.id,
+        r.siteId,
+        r.sweepId,
+        r.kind,
+        r.title,
+        r.description,
+        r.rmImpact,
+        r.kwhImpact,
+        r.confidence,
+        r.evidenceRefs,
+        r.deadline,
+        r.approvalClass,
+        r.status,
+        r.policyDecisions,
+        r.verification,
+        r.createdAt,
+        r.decidedAt,
+        r.decidedBy,
+      )
+      .run();
+  }
+
+  /**
+   * Fixture/demo seed write — not on ActionLedger.
+   * Historical issued/verified/falsified rows go through here, never saveAction.
+   */
+  async seedAction(a: ActionCommitment): Promise<void> {
+    await this.writeAction(a);
+  }
+
+  async saveAction(a: ActionCommitment): Promise<void> {
+    assertValidInitialAction(a);
+    const existing = await this.getAction(a.id);
+    if (existing) {
+      throw new LedgerError("already_exists", `Action '${a.id}' already exists`);
+    }
+    // Pure INSERT (not OR REPLACE) so a missed existence check cannot clobber.
+    const r = actionToRow(a);
+    await this.db
+      .prepare(`INSERT INTO actions (${ACTION_COLS}) VALUES (${ACTION_PLACEHOLDERS})`)
       .bind(
         r.id,
         r.siteId,
@@ -604,18 +783,8 @@ export class D1Ledger implements ActionLedger {
     if (!current) {
       throw new LedgerError("not_found", `Unknown action '${id}'`);
     }
-    assertLegalTransition(current.status, next, meta);
-    const updated: ActionCommitment = {
-      ...current,
-      status: next,
-      decidedBy: meta?.decidedBy !== undefined ? meta.decidedBy : current.decidedBy,
-      decidedAt: meta?.decidedAt !== undefined ? meta.decidedAt : current.decidedAt,
-      policyDecisions:
-        meta?.policyDecisions !== undefined
-          ? meta.policyDecisions.map((p) => ({ ...p }))
-          : current.policyDecisions,
-    };
-    await this.saveAction(updated);
+    const updated = applyTransition(current, next, meta);
+    await this.writeAction(updated);
     return updated;
   }
 
@@ -627,17 +796,21 @@ export class D1Ledger implements ActionLedger {
     if (!current) {
       throw new LedgerError("not_found", `Unknown action '${id}'`);
     }
-    assertCanSetVerification(current.status);
-    const updated: ActionCommitment = { ...current, verification: { ...v } };
-    await this.saveAction(updated);
+    const updated = applyVerification(current, v);
+    await this.writeAction(updated);
     return updated;
+  }
+
+  async nextSeq(siteId: string, dateKey: string): Promise<number> {
+    const rows = await this.listActions({ siteId });
+    return computeNextSeq(rows, siteId, dateKey);
   }
 
   async saveSweep(s: SweepRun): Promise<void> {
     const r = sweepToRow(s);
     await this.db
       .prepare(
-        `INSERT OR REPLACE INTO sweeps (id, asOfDate, startedAt, siteCount, proposedActions, blockedActions, notes) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR REPLACE INTO sweeps (${SWEEP_COLS}) VALUES (${SWEEP_PLACEHOLDERS})`,
       )
       .bind(
         r.id,
@@ -652,8 +825,7 @@ export class D1Ledger implements ActionLedger {
   }
 
   async listSweeps(limit?: number): Promise<SweepRun[]> {
-    let sql =
-      "SELECT id, asOfDate, startedAt, siteCount, proposedActions, blockedActions, notes FROM sweeps ORDER BY startedAt DESC";
+    let sql = `SELECT ${SWEEP_COLS} FROM sweeps ORDER BY startedAt DESC`;
     const params: unknown[] = [];
     if (limit !== undefined) {
       sql += " LIMIT ?";
@@ -665,9 +837,7 @@ export class D1Ledger implements ActionLedger {
 
   async latestSweep(): Promise<SweepRun | null> {
     const row = await this.db
-      .prepare(
-        "SELECT id, asOfDate, startedAt, siteCount, proposedActions, blockedActions, notes FROM sweeps ORDER BY startedAt DESC LIMIT 1",
-      )
+      .prepare(`SELECT ${SWEEP_COLS} FROM sweeps ORDER BY startedAt DESC LIMIT 1`)
       .bind()
       .first();
     return row ? rowToSweep(row) : null;
@@ -711,6 +881,7 @@ export function getLedger(env?: unknown): ActionLedger {
   }
   if (!memorySingleton) {
     const seed = buildDemoSeed(DEMO_SEED_NOW);
+    // Constructor seed path (not public saveAction) — historical issued/graded rows.
     memorySingleton = new InMemoryLedger({
       actions: seed.actions,
       sweeps: seed.sweeps,

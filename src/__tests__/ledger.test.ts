@@ -1,8 +1,11 @@
 /**
- * KREDIT action ledger tests (I4).
- * Covers InMemoryLedger, transition guard, D1Ledger via FakeD1, getLedger routing,
- * and buildDemoSeed shape. No Workers runtime required.
+ * KREDIT action ledger tests (I4 / I4b).
+ * Covers InMemoryLedger, transition guard, boundary attacks L1–L5,
+ * D1Ledger via FakeD1, getLedger routing, buildDemoSeed, migration drift.
+ * No Workers runtime required.
  */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   actionId,
@@ -15,11 +18,14 @@ import {
 } from "../domain/actions";
 import {
   _resetLedgerSingletonForTests,
+  ACTION_COLS,
   buildDemoSeed,
   D1Ledger,
   getLedger,
   InMemoryLedger,
   LedgerError,
+  SWEEP_COLS,
+  type ActionLedger,
   type D1Like,
   type D1PreparedStatement,
 } from "../data/ledger";
@@ -76,6 +82,35 @@ async function expectLedgerError(
   });
 }
 
+/** Fixture seed for non-proposed rows — not the public saveAction path. */
+async function seedAction(
+  ledger: InMemoryLedger | D1Ledger,
+  a: ActionCommitment,
+): Promise<void> {
+  await ledger.seedAction(a);
+}
+
+/** Walk a proposed action to issued with a real signature (polite path). */
+async function issueViaLegalPath(
+  ledger: ActionLedger,
+  a: ActionCommitment,
+  decidedBy = "alice",
+): Promise<ActionCommitment> {
+  await ledger.saveAction({
+    ...a,
+    status: "proposed",
+    verification: null,
+    decidedAt: null,
+    decidedBy: null,
+  });
+  await ledger.transitionAction(a.id, "awaiting_approval");
+  await ledger.transitionAction(a.id, "approved", {
+    decidedBy,
+    decidedAt: "2026-06-20T10:00:00+08:00",
+  });
+  return ledger.transitionAction(a.id, "issued");
+}
+
 // ---------------------------------------------------------------------------
 // FakeD1 — stores rows per table from bound params; answers SELECTs simply
 // ---------------------------------------------------------------------------
@@ -100,27 +135,22 @@ class FakeD1 implements D1Like {
       bind(...values: unknown[]) {
         return {
           async run() {
+            // Public create path: pure INSERT (no OR REPLACE)
+            if (/^INSERT INTO actions/i.test(normalized) && !/OR REPLACE/i.test(normalized)) {
+              const cols = ACTION_COLS.split(", ");
+              const row: Record<string, unknown> = {};
+              for (let i = 0; i < cols.length; i++) {
+                row[cols[i]!] = values[i] ?? null;
+              }
+              const id = String(row.id);
+              if (self.table("actions").has(id)) {
+                throw new Error(`FakeD1: UNIQUE constraint failed on actions.id=${id}`);
+              }
+              self.table("actions").set(id, row);
+              return { success: true };
+            }
             if (/^INSERT OR REPLACE INTO actions/i.test(normalized)) {
-              const cols = [
-                "id",
-                "siteId",
-                "sweepId",
-                "kind",
-                "title",
-                "description",
-                "rmImpact",
-                "kwhImpact",
-                "confidence",
-                "evidenceRefs",
-                "deadline",
-                "approvalClass",
-                "status",
-                "policyDecisions",
-                "verification",
-                "createdAt",
-                "decidedAt",
-                "decidedBy",
-              ];
+              const cols = ACTION_COLS.split(", ");
               const row: Record<string, unknown> = {};
               for (let i = 0; i < cols.length; i++) {
                 row[cols[i]!] = values[i] ?? null;
@@ -129,15 +159,7 @@ class FakeD1 implements D1Like {
               return { success: true };
             }
             if (/^INSERT OR REPLACE INTO sweeps/i.test(normalized)) {
-              const cols = [
-                "id",
-                "asOfDate",
-                "startedAt",
-                "siteCount",
-                "proposedActions",
-                "blockedActions",
-                "notes",
-              ];
+              const cols = SWEEP_COLS.split(", ");
               const row: Record<string, unknown> = {};
               for (let i = 0; i < cols.length; i++) {
                 row[cols[i]!] = values[i] ?? null;
@@ -253,6 +275,60 @@ describe("buildDemoSeed", () => {
     expect(denied!.verification).toBeNull();
     expect(denied!.evidenceRefs).toContain("seed_fixture");
   });
+
+  it("loads historical fixtures via constructor seed, not public saveAction", async () => {
+    const seed = buildDemoSeed("2026-07-01T00:00:00+08:00");
+    const ledger = new InMemoryLedger({
+      actions: seed.actions,
+      sweeps: seed.sweeps,
+    });
+    expect((await ledger.listActions()).length).toBe(3);
+    const verified = await ledger.getAction(seed.actions[0]!.id);
+    expect(verified?.status).toBe("issued");
+    expect(verified?.verification?.outcome).toBe("verified");
+    // public saveAction still refuses non-proposed even when seed has them
+    await expectLedgerError(
+      ledger.saveAction(baseAction({ status: "issued" })),
+      "invalid_initial_status",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N11 — migration ↔ mapping drift guard
+// ---------------------------------------------------------------------------
+
+describe("N11 migration ↔ mapping column drift guard", () => {
+  function columnsFromCreateTable(sql: string, table: string): string[] {
+    const re = new RegExp(
+      `CREATE TABLE IF NOT EXISTS ${table}\\s*\\(([^;]+?)\\)\\s*;`,
+      "is",
+    );
+    const m = sql.match(re);
+    if (!m) throw new Error(`CREATE TABLE ${table} not found in migration`);
+    const body = m[1]!;
+    return body
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith("--"))
+      .map((line) => line.replace(/,$/, "").trim())
+      .map((line) => line.split(/\s+/)[0]!)
+      .filter((name) => name.length > 0);
+  }
+
+  it("actions/sweeps columns match ACTION_COLS / SWEEP_COLS exactly", () => {
+    const sql = readFileSync(
+      join(process.cwd(), "migrations/0001_action_ledger.sql"),
+      "utf8",
+    );
+    const actionCols = columnsFromCreateTable(sql, "actions");
+    const sweepCols = columnsFromCreateTable(sql, "sweeps");
+    expect(actionCols.join(", ")).toBe(ACTION_COLS);
+    expect(sweepCols.join(", ")).toBe(SWEEP_COLS);
+    // N12 indexes present
+    expect(sql).toMatch(/idx_actions_createdAt/);
+    expect(sql).toMatch(/idx_sweeps_startedAt/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -286,7 +362,8 @@ describe("InMemoryLedger", () => {
     });
 
     await ledger.saveAction(older);
-    await ledger.saveAction(newer);
+    // issued row is fixture-seeded (public saveAction rejects non-proposed)
+    await seedAction(ledger, newer);
     await ledger.saveAction(sameSite);
 
     expect(await ledger.getAction(older.id)).toEqual(older);
@@ -333,6 +410,33 @@ describe("InMemoryLedger", () => {
     expect(await ledger.latestSweep()).toEqual(s);
   });
 
+  it("nextSeq returns max+1 for site+day (empty → 1)", async () => {
+    const ledger = new InMemoryLedger();
+    expect(await ledger.nextSeq("site_a", "2026-06-20")).toBe(1);
+    await ledger.saveAction(baseAction({ id: actionId("site_a", "2026-06-20", 1) }));
+    await ledger.saveAction(
+      baseAction({
+        id: actionId("site_a", "2026-06-20", 3),
+        siteId: "site_a",
+      }),
+    );
+    await ledger.saveAction(
+      baseAction({
+        id: actionId("site_b", "2026-06-20", 9),
+        siteId: "site_b",
+      }),
+    );
+    await ledger.saveAction(
+      baseAction({
+        id: actionId("site_a", "2026-06-21", 5),
+        siteId: "site_a",
+      }),
+    );
+    expect(await ledger.nextSeq("site_a", "2026-06-20")).toBe(4);
+    expect(await ledger.nextSeq("site_b", "2026-06-20")).toBe(10);
+    expect(await ledger.nextSeq("site_a", "2026-06-21")).toBe(6);
+  });
+
   describe("transition guard", () => {
     const legalPaths: Array<{
       from: ActionStatus;
@@ -363,10 +467,19 @@ describe("InMemoryLedger", () => {
           decidedBy: path.from === "approved" ? "alice" : null,
           decidedAt: path.from === "approved" ? "2026-06-20T10:00:00+08:00" : null,
         });
-        await ledger.saveAction(a);
+        // Non-proposed starting points go through fixture seed, not saveAction.
+        if (path.from === "proposed") {
+          await ledger.saveAction(a);
+        } else {
+          await seedAction(ledger, a);
+        }
         const next = await ledger.transitionAction(a.id, path.to, path.meta);
         expect(next.status).toBe(path.to);
         if (path.to === "approved") {
+          expect(next.decidedBy).toBe("alice");
+        }
+        if (path.to === "issued") {
+          // L4: signature stays the one set at approval, not issue-time meta alone
           expect(next.decidedBy).toBe("alice");
         }
       });
@@ -383,7 +496,7 @@ describe("InMemoryLedger", () => {
 
     it("rejects awaiting_approval -> issued", async () => {
       const ledger = new InMemoryLedger();
-      await ledger.saveAction(baseAction({ status: "awaiting_approval" }));
+      await seedAction(ledger, baseAction({ status: "awaiting_approval" }));
       await expectLedgerError(
         ledger.transitionAction(actionId("site_a", "2026-06-20", 1), "issued", {
           decidedBy: "alice",
@@ -394,7 +507,7 @@ describe("InMemoryLedger", () => {
 
     it("rejects approved WITHOUT decidedBy", async () => {
       const ledger = new InMemoryLedger();
-      await ledger.saveAction(baseAction({ status: "awaiting_approval" }));
+      await seedAction(ledger, baseAction({ status: "awaiting_approval" }));
       await expectLedgerError(
         ledger.transitionAction(actionId("site_a", "2026-06-20", 1), "approved"),
         "illegal_transition",
@@ -411,7 +524,8 @@ describe("InMemoryLedger", () => {
       const ledger = new InMemoryLedger();
       for (const terminal of ["issued", "denied_by_policy", "expired"] as const) {
         const id = actionId("site_a", "2026-06-20", terminal === "issued" ? 1 : 2);
-        await ledger.saveAction(
+        await seedAction(
+          ledger,
           baseAction({
             id,
             status: terminal,
@@ -447,7 +561,7 @@ describe("InMemoryLedger", () => {
         decidedBy: "alice",
         decidedAt: "2026-06-20T10:00:00+08:00",
       });
-      await ledger.saveAction(issued);
+      await seedAction(ledger, issued);
       const updated = await ledger.setVerification(issued.id, v);
       expect(updated.verification).toEqual(v);
       // round-trip
@@ -507,13 +621,13 @@ describe("D1Ledger (FakeD1)", () => {
     const got = await ledger.getAction(action.id);
     expect(got).toEqual(action);
 
-    // set verification after issue path
-    await ledger.saveAction({
-      ...action,
-      status: "issued",
+    // issue via legal path (public saveAction cannot set status issued)
+    await ledger.transitionAction(action.id, "awaiting_approval");
+    await ledger.transitionAction(action.id, "approved", {
       decidedBy: "alice",
       decidedAt: "2026-06-20T10:00:00+08:00",
     });
+    await ledger.transitionAction(action.id, "issued");
     const withV = await ledger.setVerification(action.id, {
       outcome: "falsified",
       measuredRm: null,
@@ -554,6 +668,7 @@ describe("D1Ledger (FakeD1)", () => {
     expect(approved.status).toBe("approved");
     const issued = await ledger.transitionAction(actionId("site_a", "2026-06-20", 1), "issued");
     expect(issued.status).toBe("issued");
+    expect(issued.decidedBy).toBe("carol");
   });
 
   it("listActions filter and newest-first order", async () => {
@@ -570,6 +685,8 @@ describe("D1Ledger (FakeD1)", () => {
       createdAt: "2026-06-21T08:00:00+08:00",
       status: "issued",
       sweepId: sweepId("2026-06-21"),
+      decidedBy: "op",
+      decidedAt: "2026-06-21T09:00:00+08:00",
     });
     const a3 = baseAction({
       id: actionId("site_b", "2026-06-22", 1),
@@ -578,7 +695,7 @@ describe("D1Ledger (FakeD1)", () => {
       status: "proposed",
     });
     await ledger.saveAction(a1);
-    await ledger.saveAction(a2);
+    await seedAction(ledger, a2);
     await ledger.saveAction(a3);
 
     expect((await ledger.listActions()).map((a) => a.id)).toEqual([a3.id, a2.id, a1.id]);
@@ -591,6 +708,257 @@ describe("D1Ledger (FakeD1)", () => {
       a1.id,
     ]);
     expect((await ledger.listActions({ limit: 2 })).map((a) => a.id)).toEqual([a3.id, a2.id]);
+  });
+
+  it("nextSeq matches InMemory (max+1)", async () => {
+    const ledger = new D1Ledger(new FakeD1());
+    expect(await ledger.nextSeq("site_a", "2026-06-20")).toBe(1);
+    await ledger.saveAction(baseAction({ id: actionId("site_a", "2026-06-20", 2) }));
+    await ledger.saveAction(
+      baseAction({ id: actionId("site_a", "2026-06-20", 5), siteId: "site_a" }),
+    );
+    expect(await ledger.nextSeq("site_a", "2026-06-20")).toBe(6);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N14 — L1–L5 boundary attacks (both backends)
+// ---------------------------------------------------------------------------
+
+describe("N14 boundary attacks (L1–L5) on both backends", () => {
+  const backends: Array<{
+    name: string;
+    fresh: () => InMemoryLedger | D1Ledger;
+  }> = [
+    { name: "InMemoryLedger", fresh: () => new InMemoryLedger() },
+    { name: "D1Ledger", fresh: () => new D1Ledger(new FakeD1()) },
+  ];
+
+  for (const { name, fresh } of backends) {
+    describe(name, () => {
+
+      // L1: cannot create an action born issued with a self-authored grade
+      it("L1: saveAction rejects status=issued with verification grade", async () => {
+        const ledger = fresh();
+        await expectLedgerError(
+          ledger.saveAction(
+            baseAction({
+              status: "issued",
+              decidedBy: null,
+              verification: {
+                outcome: "verified",
+                measuredRm: 100,
+                note: "self-authored",
+                verifiedAt: "2026-06-20T12:00:00+08:00",
+              },
+            }),
+          ),
+          "invalid_initial_status",
+        );
+      });
+
+      it("L1: saveAction rejects non-proposed statuses and pre-set decision fields", async () => {
+        const ledger = fresh();
+        for (const status of [
+          "awaiting_approval",
+          "approved",
+          "issued",
+          "denied_by_policy",
+          "expired",
+        ] as const) {
+          await expectLedgerError(
+            ledger.saveAction(baseAction({ status })),
+            "invalid_initial_status",
+          );
+        }
+        await expectLedgerError(
+          ledger.saveAction(
+            baseAction({
+              status: "proposed",
+              verification: {
+                outcome: "verified",
+                measuredRm: 1,
+                note: "x",
+                verifiedAt: "2026-06-20T12:00:00+08:00",
+              },
+            }),
+          ),
+          "invalid_initial_status",
+        );
+        await expectLedgerError(
+          ledger.saveAction(baseAction({ decidedBy: "sneaky" })),
+          "invalid_initial_status",
+        );
+        await expectLedgerError(
+          ledger.saveAction(baseAction({ decidedAt: "2026-06-20T09:00:00+08:00" })),
+          "invalid_initial_status",
+        );
+      });
+
+      // L2: saveAction with existing id cannot clobber (issued+falsified → proposed)
+      it("L2: saveAction rejects duplicate id (no silent clobber of issued+graded)", async () => {
+        const ledger = fresh();
+        const id = actionId("site_a", "2026-06-20", 1);
+        await seedAction(
+          ledger,
+          baseAction({
+            id,
+            status: "issued",
+            decidedBy: "alice",
+            decidedAt: "2026-06-20T10:00:00+08:00",
+            verification: {
+              outcome: "falsified",
+              measuredRm: 0,
+              note: "failed",
+              verifiedAt: "2026-06-27T10:00:00+08:00",
+            },
+          }),
+        );
+        await expectLedgerError(
+          ledger.saveAction(
+            baseAction({
+              id,
+              status: "proposed",
+              verification: null,
+              decidedBy: null,
+              decidedAt: null,
+            }),
+          ),
+          "already_exists",
+        );
+        const still = await ledger.getAction(id);
+        expect(still!.status).toBe("issued");
+        expect(still!.verification?.outcome).toBe("falsified");
+        expect(still!.decidedBy).toBe("alice");
+      });
+
+      // L3: setVerification cannot re-grade falsified → verified
+      it("L3: setVerification rejects when grade already set (verification_already_set)", async () => {
+        const ledger = fresh();
+        const id = actionId("site_a", "2026-06-20", 1);
+        await seedAction(
+          ledger,
+          baseAction({
+            id,
+            status: "issued",
+            decidedBy: "alice",
+            decidedAt: "2026-06-20T10:00:00+08:00",
+            verification: {
+              outcome: "falsified",
+              measuredRm: 0,
+              note: "failed",
+              verifiedAt: "2026-06-27T10:00:00+08:00",
+            },
+          }),
+        );
+        await expectLedgerError(
+          ledger.setVerification(id, {
+            outcome: "verified",
+            measuredRm: 999,
+            note: "re-grade attack",
+            verifiedAt: "2026-06-28T10:00:00+08:00",
+          }),
+          "verification_already_set",
+        );
+        const still = await ledger.getAction(id);
+        expect(still!.verification?.outcome).toBe("falsified");
+        expect(still!.verification?.measuredRm).toBe(0);
+      });
+
+      // L4: transitionAction(id,'issued',{decidedBy:'',decidedAt:''}) cannot blank signature
+      it("L4: issue-time meta cannot blank or rewrite decidedBy/decidedAt", async () => {
+        const ledger = fresh();
+        const a = baseAction({ id: actionId("site_a", "2026-06-20", 1) });
+        await issueViaLegalPath(ledger, a, "signed_operator");
+        // re-issue is illegal (already issued); test blanking on the issue step itself
+        const ledger2 = fresh();
+        const a2 = baseAction({ id: actionId("site_a", "2026-06-20", 2) });
+        await ledger2.saveAction(a2);
+        await ledger2.transitionAction(a2.id, "awaiting_approval");
+        await ledger2.transitionAction(a2.id, "approved", {
+          decidedBy: "signed_operator",
+          decidedAt: "2026-06-20T10:00:00+08:00",
+        });
+        const issued = await ledger2.transitionAction(a2.id, "issued", {
+          decidedBy: "",
+          decidedAt: "",
+        });
+        expect(issued.status).toBe("issued");
+        expect(issued.decidedBy).toBe("signed_operator");
+        expect(issued.decidedAt).toBe("2026-06-20T10:00:00+08:00");
+
+        // also: approved row with blank decidedBy cannot issue
+        const ledger3 = fresh();
+        await seedAction(
+          ledger3,
+          baseAction({
+            id: actionId("site_a", "2026-06-20", 3),
+            status: "approved",
+            decidedBy: "",
+            decidedAt: "2026-06-20T10:00:00+08:00",
+          }),
+        );
+        await expectLedgerError(
+          ledger3.transitionAction(actionId("site_a", "2026-06-20", 3), "issued", {
+            decidedBy: "attacker",
+            decidedAt: "2026-06-20T11:00:00+08:00",
+          }),
+          "illegal_transition",
+        );
+      });
+
+      // L5: seq collisions throw (already_exists) + nextSeq allocates safely
+      it("L5: seq collision throws already_exists; nextSeq allocates next free seq", async () => {
+        const ledger = fresh();
+        const dateKey = "2026-06-20";
+        const seq = await ledger.nextSeq("site_a", dateKey);
+        expect(seq).toBe(1);
+        const id = actionId("site_a", dateKey, seq);
+        await ledger.saveAction(baseAction({ id, siteId: "site_a" }));
+        // collision on same id
+        await expectLedgerError(
+          ledger.saveAction(baseAction({ id, siteId: "site_a" })),
+          "already_exists",
+        );
+        const next = await ledger.nextSeq("site_a", dateKey);
+        expect(next).toBe(2);
+        await ledger.saveAction(
+          baseAction({ id: actionId("site_a", dateKey, next), siteId: "site_a" }),
+        );
+        expect(await ledger.nextSeq("site_a", dateKey)).toBe(3);
+      });
+
+      // polite path still fully green
+      it("polite path: proposed → awaiting → approved → issued → verified", async () => {
+        const ledger = fresh();
+        const a = baseAction({ id: actionId("site_a", "2026-06-20", 7) });
+        const issued = await issueViaLegalPath(ledger, a, "carol");
+        expect(issued.status).toBe("issued");
+        expect(issued.decidedBy).toBe("carol");
+        expect(issued.verification).toBeNull();
+        const verified = await ledger.setVerification(a.id, {
+          outcome: "verified",
+          measuredRm: 95,
+          note: "ok",
+          verifiedAt: "2026-06-27T12:00:00+08:00",
+        });
+        expect(verified.verification?.outcome).toBe("verified");
+        // second grade still blocked
+        await expectLedgerError(
+          ledger.setVerification(a.id, {
+            outcome: "falsified",
+            measuredRm: 0,
+            note: "nope",
+            verifiedAt: "2026-06-28T12:00:00+08:00",
+          }),
+          "verification_already_set",
+        );
+      });
+    });
+  }
+
+  it("covers both backends", () => {
+    expect(backends.map((x) => x.name)).toEqual(["InMemoryLedger", "D1Ledger"]);
   });
 });
 
@@ -629,5 +997,10 @@ describe("getLedger", () => {
     expect(actions.every((a) => a.evidenceRefs.includes("seed_fixture"))).toBe(true);
     const sweep = await ledger.latestSweep();
     expect(sweep?.notes).toContain("seed_fixture");
+    // demo seed still has issued+graded rows (constructor path, not saveAction)
+    const issued = actions.filter((a) => a.status === "issued");
+    expect(issued.length).toBe(2);
+    expect(issued.some((a) => a.verification?.outcome === "verified")).toBe(true);
+    expect(issued.some((a) => a.verification?.outcome === "falsified")).toBe(true);
   });
 });

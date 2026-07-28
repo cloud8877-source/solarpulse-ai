@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS actions (
 
 CREATE INDEX IF NOT EXISTS idx_actions_site_status ON actions (siteId, status);
 CREATE INDEX IF NOT EXISTS idx_actions_sweepId ON actions (sweepId);
+CREATE INDEX IF NOT EXISTS idx_actions_createdAt ON actions (createdAt);
 
 CREATE TABLE IF NOT EXISTS sweeps (
   id TEXT PRIMARY KEY NOT NULL,
@@ -34,3 +35,5 @@ CREATE TABLE IF NOT EXISTS sweeps (
   blockedActions INTEGER NOT NULL,
   notes TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_sweeps_startedAt ON sweeps (startedAt);
