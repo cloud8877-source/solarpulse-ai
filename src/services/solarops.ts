@@ -218,6 +218,12 @@ export interface KreditScoreboard {
   verified_count: number;
   partial_count: number;
   falsified_count: number;
+  /**
+   * Issued load_shift rows with a non-null RM claim, no verification yet, whose
+   * deadline period has observed coverage below verifyCoverageFloor. Excluded
+   * from action_accuracy denominator (left ungraded by the coverage gate).
+   */
+  ungraded_insufficient_coverage: number;
 }
 
 function mapLedgerError(err: unknown): never {
@@ -1277,8 +1283,38 @@ export function createSolarOpsService(
     let verified = 0;
     let partial = 0;
     let falsified = 0;
+    let ungradedInsufficientCoverage = 0;
+    const floor = assumptions.kredit.verifyCoverageFloor;
+    // Cache realized coverage per site+periodEnd (demo-scale).
+    const coverageCache = new Map<string, number>();
+    function coverageRatioFor(siteId: string, deadline: string): number | null {
+      try {
+        const { periodEnd: pe } = billingPeriodBounds(deadline.slice(0, 10));
+        const key = `${siteId}|${pe}`;
+        const hit = coverageCache.get(key);
+        if (hit != null) return hit;
+        const realized = atapRealizedValue(siteId, pe);
+        const ratio =
+          realized.days_in_period > 0
+            ? realized.observed_days / realized.days_in_period
+            : 0;
+        coverageCache.set(key, ratio);
+        return ratio;
+      } catch {
+        return null;
+      }
+    }
     for (const a of actions) {
-      if (a.status !== "issued" || !a.verification) continue;
+      if (a.status !== "issued") continue;
+      if (!a.verification) {
+        // Coverage-gate leftovers: gradeable load_shift claims left ungraded
+        // because the period's observed actuals are below the floor.
+        if (a.kind === "load_shift" && a.rmImpact != null) {
+          const ratio = coverageRatioFor(a.siteId, a.deadline);
+          if (ratio != null && ratio < floor) ungradedInsufficientCoverage += 1;
+        }
+        continue;
+      }
       if (a.rmImpact != null) rmIdentified = round(rmIdentified + a.rmImpact);
       const o = a.verification.outcome;
       if (o === "verified") {
@@ -1304,6 +1340,7 @@ export function createSolarOpsService(
       verified_count: verified,
       partial_count: partial,
       falsified_count: falsified,
+      ungraded_insufficient_coverage: ungradedInsufficientCoverage,
     };
   }
 

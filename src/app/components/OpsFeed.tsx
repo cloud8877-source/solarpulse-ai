@@ -518,6 +518,13 @@ export function OpsFeed({ sweeps, actionsBySweep, scoreboard }: FeedProps) {
           <span className="sub">verified / graded</span>
         </div>
       </div>
+      {scoreboard.ungraded_insufficient_coverage > 0 ? (
+        <div style={{ marginBottom: 14 }}>
+          <span className="badge tag" title="Left ungraded — coverage below verifyCoverageFloor">
+            {scoreboard.ungraded_insufficient_coverage} ungraded — insufficient coverage
+          </span>
+        </div>
+      ) : null}
 
       {runMsg ? (
         <p className="muted" style={{ marginBottom: 14, fontSize: "0.86rem" }}>

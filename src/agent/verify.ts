@@ -101,10 +101,11 @@ function deadlineInPeriod(
 function gradeBandAssumptions(): string[] {
   const t = assumptions.kredit.verifyTolerancePct;
   const p = assumptions.kredit.partialFloorPct;
+  const floor = assumptions.kredit.verifyCoverageFloor;
   return [
     `verifyTolerancePct=${t}: verified when measuredRm >= rmImpact × (1 − ${t})`,
     `partialFloorPct=${p}: partial when measuredRm >= rmImpact × ${p}; else falsified`,
-    `verifyCoverageFloor=${assumptions.kredit.verifyCoverageFloor}: below this, coverage caveat is recorded (still grades on observed actuals)`,
+    `verifyCoverageFloor=${floor}: below this, verification is REFUSED (insufficient_coverage) and the action is left ungraded — a full-period claim cannot be graded against partial actuals`,
   ];
 }
 
@@ -116,8 +117,9 @@ function gradeBandAssumptions(): string[] {
  *    (no RM claim to grade) — not auto-verified.
  *  - Stranded approved rows with closed-period deadlines: issueAction first
  *    (honors the recorded human signature), then grade.
- *  - Partial fixture coverage: grade on observed actuals with coverage caveat
- *    in verification.assumptions (no silent annualisation).
+ *  - Coverage gate: if observed_days/days_in_period < verifyCoverageFloor,
+ *    SKIP (insufficient_coverage) — do NOT write a permanent grade (a
+ *    full-period claim cannot be graded against partial-period actuals).
  *  - proposed→expired remains illegal (no path strands at proposed).
  */
 export async function runVerification(
@@ -245,20 +247,39 @@ export async function runVerification(
     }
 
     const realized = realizedFor(a.siteId);
-    const measuredRm = realized.smp_spread_rm;
-    const outcome = gradeMeasuredRm(measuredRm, a.rmImpact);
     const coverageRatio =
       realized.days_in_period > 0
         ? realized.observed_days / realized.days_in_period
         : 0;
-    const coverageCaveat =
-      coverageRatio < assumptions.kredit.verifyCoverageFloor
-        ? `coverage caveat: only ${realized.observed_days}/${realized.days_in_period} days observed (${(coverageRatio * 100).toFixed(1)}%) — graded on recorded actuals, not annualised`
-        : `coverage ${realized.observed_days}/${realized.days_in_period} days observed`;
+    const floor = assumptions.kredit.verifyCoverageFloor;
+
+    // Coverage gate: refuse permanent grades on partial-period actuals.
+    // Spurious FALSIFIED cannot be corrected (verification_already_set) —
+    // leave the action ungraded for a future full-coverage period.
+    if (coverageRatio < floor) {
+      skipped += 1;
+      const pct = (coverageRatio * 100).toFixed(1);
+      const floorPct = (floor * 100).toFixed(0);
+      rows.push({
+        action_id: a.id,
+        site_id: a.siteId,
+        kind: a.kind,
+        disposition: "skipped",
+        note:
+          `insufficient_coverage: ${realized.observed_days}/${realized.days_in_period} days observed ` +
+          `(${pct}% < floor ${floorPct}%) — a full-period claim cannot be graded against a ` +
+          `partial-period actual; action left ungraded`,
+      });
+      continue;
+    }
+
+    const measuredRm = realized.smp_spread_rm;
+    const outcome = gradeMeasuredRm(measuredRm, a.rmImpact);
+    const coverageNote = `coverage ${realized.observed_days}/${realized.days_in_period} days observed`;
 
     const vAssumptions = [
       ...bandAssumptions,
-      coverageCaveat,
+      coverageNote,
       ...realized.assumptions,
       `claimed rmImpact=RM ${a.rmImpact}; measuredRm=RM ${measuredRm} (realized smp_spread_rm)`,
       `export_kwh=${realized.export_kwh}; import_kwh=${realized.import_kwh}; daylight_import_kwh=${realized.daylight_import_kwh}; load_shiftable_export_kwh=${realized.load_shiftable_export_kwh}`,
@@ -271,7 +292,7 @@ export async function runVerification(
         `${outcome}: measured RM ${measuredRm} vs claimed RM ${a.rmImpact} ` +
         `(tolerance ${(assumptions.kredit.verifyTolerancePct * 100).toFixed(0)}% / ` +
         `partial floor ${(assumptions.kredit.partialFloorPct * 100).toFixed(0)}%). ` +
-        coverageCaveat,
+        coverageNote,
       verifiedAt: nowIso,
       assumptions: vAssumptions,
     };
@@ -302,6 +323,7 @@ export async function runVerification(
     assumptions: [
       ...bandAssumptions,
       "period gate: period_end must be strictly before today (local +08)",
+      "coverage gate: observed_days/days_in_period < verifyCoverageFloor → skipped (insufficient_coverage), action left ungraded",
       "stranded approved → issueAction then grade (honors recorded signature)",
       "awaiting_approval with closed deadline → expired (period_closed_unsigned)",
       "auto-escalate / null-RM issued rows skipped (no RM claim to grade)",
