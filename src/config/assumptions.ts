@@ -134,6 +134,19 @@ export const assumptions = {
     maxNonEscalateActionsPerSite: 3,
     /** Bounded retries when saveAction returns already_exists (C4). */
     proposeMaxRetries: 5,
+    /**
+     * Meter-verification grade bands (I6). Grader reads these — never hardcode.
+     * verified when measuredRm >= rmImpact × (1 − verifyTolerancePct);
+     * partial when measuredRm >= rmImpact × partialFloorPct; else falsified.
+     */
+    verifyTolerancePct: 0.25,
+    partialFloorPct: 0.5,
+    /**
+     * Minimum observed_days / days_in_period for "full-coverage" grading notes.
+     * Below this, verification still grades on observed actuals but records a
+     * coverage caveat (fixtures cover only a few mid-month days).
+     */
+    verifyCoverageFloor: 0.8,
   },
 };
 

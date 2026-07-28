@@ -23,7 +23,11 @@ import {
   type ActionVerification,
   type PolicyDecision,
 } from "../domain/actions";
-import { billingPeriodBounds, computeAtapCreditClock } from "../engine/atap";
+import {
+  billingPeriodBounds,
+  computeAtapCreditClock,
+  computeAtapRealizedValue,
+} from "../engine/atap";
 import { detectUnderperformance } from "../engine/anomaly";
 import { expectedProfile, fixtureWape, forecastSolarYield } from "../engine/forecast";
 import { generateGreenReport } from "../engine/greenReport";
@@ -91,7 +95,8 @@ export type SolarOpsErrorCode =
   | "smp_unavailable"
   | "illegal_field"
   | "action_not_found"
-  | "ledger_error";
+  | "ledger_error"
+  | "period_not_closed";
 
 export class SolarOpsError extends Error {
   constructor(
@@ -186,6 +191,33 @@ export interface ActionVerbs {
     id: string,
     verification: ActionVerification,
   ): Promise<ActionCommitment>;
+}
+
+/**
+ * Read-only action surface for UI / non-model layers (I7-3 / I7-7).
+ * Pages use these verbs only — never import getLedger for feed reads.
+ */
+export interface ActionReads {
+  listSweepFeed(limit?: number): Promise<import("../domain/actions").SweepRun[]>;
+  listSweepActions(
+    sweepId: string,
+    limit?: number,
+  ): Promise<ActionCommitment[]>;
+  getKreditScoreboard(): Promise<KreditScoreboard>;
+}
+
+/** Lifetime KREDIT scoreboard — engine/ledger derived numbers only. */
+export interface KreditScoreboard {
+  /** Sum rmImpact of issued actions that carry a verification grade. */
+  rm_identified: number;
+  /** Sum measuredRm of verified + partial outcomes. */
+  rm_verified: number;
+  /** verified count / graded count (verified+partial+falsified); null if none graded. */
+  action_accuracy: number | null;
+  graded_count: number;
+  verified_count: number;
+  partial_count: number;
+  falsified_count: number;
 }
 
 function mapLedgerError(err: unknown): never {
@@ -1205,6 +1237,196 @@ export function createSolarOpsService(
   }
 
   /**
+   * awaiting_approval → expired with a policy decision (I6 period-closed expiry).
+   * Used by the verifier pass — not a model-callable verb.
+   */
+  async function expireAction(
+    id: string,
+    meta: { policyDecisions: PolicyDecision[]; decidedAt?: string },
+  ): Promise<ActionCommitment> {
+    try {
+      return await ledger().transitionAction(id, "expired", {
+        policyDecisions: meta.policyDecisions,
+        ...(meta.decidedAt !== undefined ? { decidedAt: meta.decidedAt } : {}),
+      });
+    } catch (err) {
+      mapLedgerError(err);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // ActionReads (I7-3) — bound feed surface; UI never holds raw ledger.
+  // -------------------------------------------------------------------------
+
+  async function listSweepFeed(limit = 10): Promise<import("../domain/actions").SweepRun[]> {
+    return ledger().listSweeps(limit);
+  }
+
+  async function listSweepActions(
+    sweepId: string,
+    limit = 50,
+  ): Promise<ActionCommitment[]> {
+    return ledger().listActions({ sweepId, limit });
+  }
+
+  async function getKreditScoreboard(): Promise<KreditScoreboard> {
+    // Demo-scale bound: seed + recent sweeps; no unbounded scan.
+    const actions = await ledger().listActions({ limit: 500 });
+    let rmIdentified = 0;
+    let rmVerified = 0;
+    let verified = 0;
+    let partial = 0;
+    let falsified = 0;
+    for (const a of actions) {
+      if (a.status !== "issued" || !a.verification) continue;
+      if (a.rmImpact != null) rmIdentified = round(rmIdentified + a.rmImpact);
+      const o = a.verification.outcome;
+      if (o === "verified") {
+        verified += 1;
+        if (a.verification.measuredRm != null) {
+          rmVerified = round(rmVerified + a.verification.measuredRm);
+        }
+      } else if (o === "partial") {
+        partial += 1;
+        if (a.verification.measuredRm != null) {
+          rmVerified = round(rmVerified + a.verification.measuredRm);
+        }
+      } else if (o === "falsified") {
+        falsified += 1;
+      }
+    }
+    const graded = verified + partial + falsified;
+    return {
+      rm_identified: rmIdentified,
+      rm_verified: rmVerified,
+      action_accuracy: graded > 0 ? round(verified / graded, 4) : null,
+      graded_count: graded,
+      verified_count: verified,
+      partial_count: partial,
+      falsified_count: falsified,
+    };
+  }
+
+  /**
+   * Realized ATAP value on a closed billing period's actuals (I6 / B1).
+   * Snake_case DTO + SourceManifest; measuredRm-class currency for the
+   * grounding pool when a future tool surfaces these numbers.
+   * No projection — observed only.
+   */
+  function atapRealizedValue(siteId: string, periodEnd: string, now?: string) {
+    const site = requireSite(siteId);
+    const day = periodEnd.slice(0, 10);
+    const { periodStart, periodEnd: end } = billingPeriodBounds(day);
+    if (day !== end) {
+      throw new SolarOpsError(
+        "illegal_field",
+        `periodEnd must be the last calendar day of the billing period (got '${day}', expected '${end}')`,
+      );
+    }
+
+    // Preceding calendar month of the period (gazette §2 Average SMP).
+    const y = Number(day.slice(0, 4));
+    const m = Number(day.slice(5, 7));
+    const prevMonth = m === 1 ? 12 : m - 1;
+    const prevYear = m === 1 ? y - 1 : y;
+    const smpMonthLabel = `${prevYear}-${String(prevMonth).padStart(2, "0")}`;
+    const smpEntry =
+      assumptions.atap.averageSmpByMonth[
+        smpMonthLabel as keyof typeof assumptions.atap.averageSmpByMonth
+      ];
+    if (!smpEntry) {
+      throw new SolarOpsError(
+        "smp_unavailable",
+        `No Average SMP entry for preceding month '${smpMonthLabel}' (periodEnd ${day}).`,
+      );
+    }
+
+    // Full closed-period observations (start…end inclusive).
+    const observations = store.getObservations(siteId).filter((o) => {
+      const d = dateKey(o.timestamp);
+      return d >= periodStart && d <= end;
+    });
+    const weather = store.getWeather(siteId).filter((w) => {
+      const d = dateKey(w.timestamp);
+      return d >= periodStart && d <= end;
+    });
+    const expectedKwhByTimestamp = new Map(
+      expectedProfile(site, weather).map((i) => [i.timestamp, i.expectedKwh]),
+    );
+    const tariff = site.tariffAssumptionRmPerKwh ?? assumptions.retailTariffRmPerKwh;
+
+    const result = computeAtapRealizedValue({
+      site: {
+        id: site.id,
+        capacityKwp: site.capacityKwp,
+        tariffRmPerKwh: tariff,
+        tariffCategory: site.tariffCategory,
+      },
+      observations,
+      periodDate: day,
+      averageSmp: {
+        rmPerKwh: smpEntry.rmPerKwh,
+        monthLabel: smpMonthLabel,
+        provenance: smpEntry.provenance,
+        source: smpEntry.source,
+      },
+      assumptions,
+      expectedKwhByTimestamp,
+    });
+
+    const runId = `atap_realized_${siteId}_${day.replace(/-/g, "")}`;
+    const manifest = buildSourceManifest({
+      runId,
+      inputs: [
+        FIXTURE_INPUTS.solar_sites!,
+        FIXTURE_INPUTS.solar_observations!,
+        {
+          name: "average_smp",
+          sourceType: smpEntry.provenance,
+          sourceName: `Average SMP ${smpMonthLabel}`,
+          url: smpEntry.source.startsWith("http") ? smpEntry.source.split(" ")[0] : undefined,
+          isFixture: false,
+        },
+      ],
+      assumptions: [
+        ...STANDARD_ASSUMPTIONS,
+        {
+          name: "atap_average_smp_rm_per_kwh",
+          value: smpEntry.rmPerKwh,
+          note: `Preceding month ${smpMonthLabel}; provenance=${smpEntry.provenance}`,
+        },
+        {
+          name: "verify_tolerance_pct",
+          value: assumptions.kredit.verifyTolerancePct,
+          note: "Grade band: verified when measuredRm >= rmImpact × (1 − this)",
+        },
+        {
+          name: "partial_floor_pct",
+          value: assumptions.kredit.partialFloorPct,
+          note: "Grade band: partial when measuredRm >= rmImpact × this",
+        },
+      ],
+      ...(now ? { now } : {}),
+    });
+
+    return {
+      site_id: siteId,
+      period_start: result.periodStart,
+      period_end: result.periodEnd,
+      days_in_period: result.daysInPeriod,
+      observed_days: result.observedDays,
+      export_kwh: result.exportKwh,
+      import_kwh: result.importKwh,
+      daylight_import_kwh: result.daylightImportKwh,
+      load_shiftable_export_kwh: result.loadShiftableExportKwh,
+      /** Realized SMP-spread (RM) — measuredRm-class currency for grounding. */
+      smp_spread_rm: result.smpSpreadRm,
+      assumptions: result.assumptions,
+      source_manifest: manifest,
+    };
+  }
+
+  /**
    * Deterministic candidate generation from ATAP credit-clock + detection (C5).
    * The model never invents candidates — only selects by id and authors narrative.
    *
@@ -1391,6 +1613,8 @@ export function createSolarOpsService(
     generateSolarReport,
     generateGreenPerformanceReport,
     atapCreditClock,
+    /** Closed-period realized value (I6) — observed actuals only. */
+    atapRealizedValue,
     // KREDIT action surface (C1 / C4 / C5)
     proposeAction,
     requestApproval,
@@ -1399,7 +1623,12 @@ export function createSolarOpsService(
     approveAction,
     issueAction,
     verifyAction,
+    expireAction,
     proposeCreditActionsDeterministic,
+    // ActionReads (I7-3) — UI feed / scoreboard; no raw ledger.
+    listSweepFeed,
+    listSweepActions,
+    getKreditScoreboard,
     /** Opt-in live+fixture weather merge (async; off the default hot path). */
     getWeatherMerged,
     /** Pure merge helper — fixture wins; live fills gaps. No I/O. */

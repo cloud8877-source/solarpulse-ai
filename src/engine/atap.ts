@@ -464,3 +464,124 @@ export function computeAtapCreditClock(input: AtapCreditClockInput): AtapCreditC
     assumptions: statedAssumptions,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Realized (closed-period) value — no projection; observed actuals only (I6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Input for realized ATAP value over a CLOSED billing period.
+ * Same site / SMP / assumptions / expected map as computeAtapCreditClock;
+ * observations should cover the full period (or whatever was recorded —
+ * partial coverage is allowed and disclosed via coverage fields).
+ */
+export type AtapRealizedValueInput = {
+  site: AtapSiteInput;
+  /** Observations scoped to the closed billing period (period_start…period_end). */
+  observations: Observation[];
+  /** Any date in the closed period (used only for billingPeriodBounds). */
+  periodDate: string;
+  averageSmp: AtapAverageSmp;
+  assumptions: Assumptions;
+  expectedKwhByTimestamp: Record<string, number> | Map<string, number>;
+};
+
+/**
+ * Realized load-shift opportunity on a closed period's actuals.
+ * Same settlement formulas as the projection path, WITHOUT the linear_daily_mean
+ * scale-up: uses observed export/import/daylight-import only.
+ *
+ * - offsettableExport = min(export, import, MAQ)  (clause d)
+ * - loadShiftableExport = min(offsettableExport, daylightImport)  (no storage)
+ * - smpSpreadRm = loadShiftableExport × (avoidedCost − Average SMP)
+ */
+export interface AtapRealizedValue {
+  periodStart: string;
+  periodEnd: string;
+  daysInPeriod: number;
+  observedDays: number;
+  exportKwh: number;
+  importKwh: number;
+  daylightImportKwh: number;
+  loadShiftableExportKwh: number;
+  smpSpreadRm: number;
+  assumptions: string[];
+}
+
+/**
+ * Realized-value computation for a closed billing period (I6 / B1).
+ * Deterministic, no LLM. Citations match computeAtapCreditClock.
+ *
+ * Partial observation coverage is handled honestly: grades use whatever
+ * observations were recorded; callers must surface observedDays / daysInPeriod
+ * as a coverage caveat (no silent annualisation).
+ */
+export function computeAtapRealizedValue(input: AtapRealizedValueInput): AtapRealizedValue {
+  const { site, observations, periodDate, averageSmp, assumptions: A, expectedKwhByTimestamp } =
+    input;
+  const { periodStart, periodEnd, daysInPeriod } = billingPeriodBounds(periodDate);
+
+  // Observed days: any of load / import / export non-null (same predicate as clock).
+  const observedDaySet = new Set<string>();
+  for (const o of observations) {
+    if (o.loadKwh != null || o.importKwh != null || o.exportKwh != null) {
+      observedDaySet.add(dateKey(o.timestamp));
+    }
+  }
+  const observedDays = observedDaySet.size;
+  const countedRows = observations.filter((o) => observedDaySet.has(dateKey(o.timestamp)));
+
+  const importKwhRaw = sumNullable(countedRows.map((o) => o.importKwh));
+  const exportKwhRaw = sumNullable(countedRows.map((o) => o.exportKwh));
+
+  let daylightImportKwhRaw = 0;
+  for (const o of countedRows) {
+    if (expectedAt(expectedKwhByTimestamp, o.timestamp) > 0 && o.importKwh != null) {
+      daylightImportKwhRaw += o.importKwh;
+    }
+  }
+
+  // MAQ for the full period (gazette §2) — even when coverage is partial, MAQ is calendar-based.
+  const maqKwh = site.capacityKwp * A.atap.sunHoursPerDay * daysInPeriod;
+
+  // Same trim as projection path, on observed (not projected) totals.
+  const offsettableExportKwhRaw = Math.min(exportKwhRaw, importKwhRaw, maqKwh);
+  const loadShiftableExportKwhRaw = Math.min(offsettableExportKwhRaw, daylightImportKwhRaw);
+
+  const avoided = avoidedCostRmPerKwh(site, A);
+  const spreadRate = avoided.rate - averageSmp.rmPerKwh;
+  const smpSpreadRmRaw = loadShiftableExportKwhRaw * spreadRate;
+
+  const exportKwh = round(exportKwhRaw);
+  const importKwh = round(importKwhRaw);
+  const daylightImportKwh = round(daylightImportKwhRaw);
+  const loadShiftableExportKwh = round(loadShiftableExportKwhRaw);
+  const smpSpreadRm = round(smpSpreadRmRaw);
+
+  const coverageRatio = daysInPeriod > 0 ? observedDays / daysInPeriod : 0;
+  const statedAssumptions: string[] = [
+    "realized path: observed actuals only — no linear_daily_mean projection",
+    A.atap.kwpAsKwacProxy
+      ? "capacity kWp used as kWac proxy (site capacity fields are kWp, not measured kWac)"
+      : "capacity treated as kWac",
+    `Average SMP for preceding month ${averageSmp.monthLabel}: RM ${averageSmp.rmPerKwh}/kWh (${averageSmp.provenance}; ${averageSmp.source})`,
+    `smpSpreadRm avoided-cost rate: ${avoided.label}`,
+    `MAQ = ${site.capacityKwp} kWp × ${A.atap.sunHoursPerDay} sun-hours × ${daysInPeriod} days = ${round(maqKwh)} kWh (gazette §2)`,
+    `coverage: ${observedDays}/${daysInPeriod} days observed (${round(coverageRatio * 100, 1)}%) — partial coverage grades on recorded actuals only, no annualisation`,
+    "offsettableExport = min(export, import, MAQ); loadShiftableExport = min(offsettable, daylightImport); smpSpread = loadShiftable × (avoided − SMP)",
+    "daylight-concurrent = intervals with expected generation > 0 (same predicate as green-report measurable-interval coverage)",
+  ];
+
+  return {
+    periodStart,
+    periodEnd,
+    daysInPeriod,
+    observedDays,
+    exportKwh,
+    importKwh,
+    daylightImportKwh,
+    loadShiftableExportKwh,
+    smpSpreadRm,
+    assumptions: statedAssumptions,
+  };
+}
