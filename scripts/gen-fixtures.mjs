@@ -74,17 +74,24 @@ const DAY_IRRADIANCE_SCALE = {
 };
 
 // Exact day-4 (2026-06-21) daylight generation values from the previous single-day
-// fixture (11 daylight hours). site_c scaled 1200→950; missing peak hours expanded
-// to 11–14 so missingFraction = 4/24 > 0.15 under the engine's all-interval denominator.
+// fixture (11 daylight hours). site_c scaled 1200→950; missing peak hours 11–14.
+//
+// site_c data_issue trigger (days 3–4) — what actually fires under the engine:
+//   • stale_telemetry on the 4 null rows → stale > 0 ALWAYS forces data_issue
+//     (this alone is sufficient; the 4-hour expansion did not invent the severity).
+//   • missingFraction = 4/24 ≈ 0.1667 vs maxMissingFraction 0.15 → marginal but true.
+//   • noisyFraction = 7/24 ≈ 0.2917 vs minNoisyFractionForIssue 0.30 → BELOW threshold
+//     (noisy path is dormant; severity does not depend on it).
 const DAY4_GENERATION = {
   site_a: [164.82, 305.18, 422.83, 541.3, 599.83, 594.64, 596.19, 534.59, 426.06, 316.55, 157.15],
+  // Byte-stable across increments (utility-farm generation profile; do not retune casually).
   site_b: [471.23, 905.87, 1275.67, 1276.96, 1421.34, 1470.44, 1421.34, 1276.96, 1275.67, 905.87, 471.23],
-  // Scaled from 1200 kWp historical; hour 11 (index 3) now null for 4 missing of 24.
+  // Scaled from 1200 kWp historical; hours 11–14 null (see data_issue note above).
   site_c: [
     round(205.14 * SITE_C_CAPACITY_SCALE),
     round(414.61 * SITE_C_CAPACITY_SCALE),
     round(582.58 * SITE_C_CAPACITY_SCALE),
-    null, // hour 11 — extra missing so data_issue survives 24h window
+    null, // hour 11 — null + stale_telemetry (forces data_issue)
     null, // hour 12
     null, // hour 13
     null, // hour 14
@@ -103,7 +110,7 @@ const SITE_B_PEAK_HOURS = new Set([11, 12, 13, 14, 15]);
 // site_b day-2 watch: uniform residual ~-7% (watch band -5%..-10%).
 const SITE_B_WATCH_FACTOR = 0.93;
 
-// site_c data_issue days: missing daylight hours (4 of 24 → 16.7% > 0.15 threshold).
+// site_c data_issue days: 4 missing daylight hours (stale>0 always fires; see DAY4 note).
 const SITE_C_MISSING_HOURS = new Set([11, 12, 13, 14]);
 
 function round(n, dp = 2) {
@@ -156,9 +163,15 @@ function isDaylight(hour) {
   return hour >= 8 && hour <= 18;
 }
 
-/** Site-day cloud cover. site_a day 2 is distinctly cloudier (R3). */
+/**
+ * Site-day cloud cover.
+ * site_a day 2 is deliberately cloudier (0.65) so it straddles the engine's
+ * weatherNormal threshold (mean cloud < 0.6): scoped day-2 → false; unscoped
+ * 4-day mean (~0.31) → true. Generation is reduced with irradiance so residual
+ * stays HEALTHY (performing to the cloudy expectation).
+ */
 function cloudFor(siteId, day) {
-  if (siteId === "site_a" && day === "2026-06-19") return 0.45;
+  if (siteId === "site_a" && day === "2026-06-19") return 0.65;
   return SITES[siteId].cloud;
 }
 
@@ -169,8 +182,8 @@ function cloudFor(siteId, day) {
 function irradianceScale(siteId, day) {
   let scale = DAY_IRRADIANCE_SCALE[day];
   if (siteId === "site_a" && day === "2026-06-19") {
-    // Cloud 0.45 vs usual 0.20 → ~22% lower clear-sky-equivalent irradiance.
-    scale *= 0.78;
+    // Cloud 0.65 vs usual 0.20 → ~35% lower clear-sky-equivalent irradiance.
+    scale *= 0.65;
   }
   return scale;
 }
@@ -191,7 +204,10 @@ function weatherAt(siteId, day, hour) {
 /**
  * Absolute load profile (kWh/h). Continuous 24h; deterministic.
  * site_a: C&I rooftop — weekday daytime ~260–330, night baseload ~90–120; weekend drop days 3–4.
- * site_b: utility plant — small auxiliary load only (exports nearly everything).
+ * site_b: deliberate "utility solar farm" shape (ATAP-ineligible at 2500 kWp) —
+ *   minimal flat auxiliary load only (45–70 kWh/h), zero daytime import (load << gen),
+ *   exports nearly all generation. Generation is byte-stable across increments
+ *   (DAY4_GENERATION + peak/watch factors); load retunes must not touch generation.
  * site_c: industrial profile scaled to 950 kWp.
  */
 function loadKwhFor(siteId, day, hour) {
@@ -220,11 +236,12 @@ function loadKwhFor(siteId, day, hour) {
   }
 
   if (siteId === "site_b") {
-    // Utility plant auxiliary only — tiny vs multi-MWh generation.
+    // Utility solar farm: flat aux load 45–70 kWh/h (see profile comment above).
+    // Daytime import stays zero because gen ≫ load; export ≈ gen − aux.
     const aux = [
-      35, 32, 30, 30, 32, 35, 40, 45, // 0–7
-      55, 60, 65, 70, 70, 68, 65, 60, 55, 50, 45, // 8–18
-      42, 40, 38, 36, 35, // 19–23
+      45, 45, 45, 45, 45, 48, 50, 55, // 0–7
+      60, 65, 68, 70, 70, 68, 65, 60, 55, 52, 50, // 8–18
+      48, 48, 46, 45, 45, // 19–23
     ];
     return aux[hour];
   }
