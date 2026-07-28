@@ -125,6 +125,16 @@ export const assumptions = {
     confidenceWeight: { low: 0.4, medium: 0.7, high: 1.0 } satisfies Record<Confidence, number>,
     uncertaintyPenalty: 0.1,
   },
+
+  // --- KREDIT sweep / action candidates (I5) ---
+  kredit: {
+    /** Minimum value_leak.total_rm (RM) to emit a load_shift candidate. */
+    valueLeakThresholdRm: 100,
+    /** Max non-escalate actions committed per site in one sweep (governor rate_limit). */
+    maxNonEscalateActionsPerSite: 3,
+    /** Bounded retries when saveAction returns already_exists (C4). */
+    proposeMaxRetries: 5,
+  },
 };
 
 export type Assumptions = typeof assumptions;

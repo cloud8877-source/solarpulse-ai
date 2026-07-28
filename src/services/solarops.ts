@@ -8,8 +8,21 @@ import {
   mergeWeatherPreferFixture,
   type FetchLiveWeatherOpts,
 } from "../data/liveWeather";
+import {
+  getLedger,
+  LedgerError,
+  type ActionLedger,
+  type TransitionMeta,
+} from "../data/ledger";
 import { buildSourceManifest, FIXTURE_INPUTS, STANDARD_ASSUMPTIONS } from "../data/sourceManifest";
 import { getStore, type SolarStore } from "../data/store";
+import {
+  actionId,
+  type ActionCommitment,
+  type ActionKind,
+  type ActionVerification,
+  type PolicyDecision,
+} from "../domain/actions";
 import { billingPeriodBounds, computeAtapCreditClock } from "../engine/atap";
 import { detectUnderperformance } from "../engine/anomaly";
 import { expectedProfile, fixtureWape, forecastSolarYield } from "../engine/forecast";
@@ -21,6 +34,7 @@ import { classifyRootCause } from "../engine/rootCause";
 import type {
   AnomalyEvent,
   AnomalyResult,
+  Confidence,
   GridHorizon,
   Horizon,
   Observation,
@@ -53,6 +67,12 @@ export type SolarOpsServiceOptions = {
    * asOfDate as "today".
    */
   liveWeatherFetcher?: LiveWeatherFetcher | null;
+  /**
+   * Action commitment ledger (KREDIT). Defaults to getLedger() when action
+   * verbs are first used. Inject a fresh InMemoryLedger in tests.
+   * Tool/agent code must NEVER hold this handle — only service verbs may.
+   */
+  ledger?: ActionLedger;
 };
 
 const REFERENCE_SITE_ID = "site_a"; // healthy reference for the model backtest WAPE
@@ -60,12 +80,18 @@ const REFERENCE_SITE_ID = "site_a"; // healthy reference for the model backtest 
 const LOCAL_OFFSET = "+08:00";
 const LOCAL_OFFSET_MS = 8 * 60 * 60 * 1000;
 
+/** Visible non-human principal for governor auto-approve of escalate (C3 / auto_class). */
+export const GOVERNOR_AUTO_PRINCIPAL = "system:governor/auto";
+
 export type SolarOpsErrorCode =
   | "site_not_found"
   | "anomaly_not_found"
   | "no_observations"
   | "grid_unavailable"
-  | "smp_unavailable";
+  | "smp_unavailable"
+  | "illegal_field"
+  | "action_not_found"
+  | "ledger_error";
 
 export class SolarOpsError extends Error {
   constructor(
@@ -75,6 +101,89 @@ export class SolarOpsError extends Error {
     super(message);
     this.name = "SolarOpsError";
   }
+}
+
+/** Fields the model / caller may never inject on propose (C1). */
+const ILLEGAL_PROPOSE_FIELDS = [
+  "decidedBy",
+  "decidedAt",
+  "verification",
+  "status",
+] as const;
+
+/** Candidate produced by proposeCreditActionsDeterministic — not yet on the ledger. */
+export interface ActionCandidate {
+  id: string;
+  siteId: string;
+  sweepId: string;
+  kind: ActionKind;
+  title: string;
+  description: string;
+  rmImpact: number | null;
+  kwhImpact: number | null;
+  confidence: Confidence;
+  evidenceRefs: string[];
+  deadline: string;
+  approvalClass: "auto" | "human_signature";
+}
+
+export type ProposeActionInput = {
+  id?: string;
+  siteId: string;
+  sweepId: string;
+  kind: ActionKind;
+  title: string;
+  description: string;
+  rmImpact: number | null;
+  kwhImpact: number | null;
+  confidence: Confidence;
+  evidenceRefs: string[];
+  deadline: string;
+  approvalClass: "auto" | "human_signature";
+  /** Optional seed for policy decisions on the proposed row (usually empty). */
+  policyDecisions?: PolicyDecision[];
+  createdAt?: string;
+};
+
+function mapLedgerError(err: unknown): never {
+  if (err instanceof SolarOpsError) throw err;
+  if (err instanceof LedgerError) {
+    if (err.code === "not_found") {
+      throw new SolarOpsError("action_not_found", err.message);
+    }
+    if (err.code === "verification_already_set" || err.code === "verification_not_allowed") {
+      throw new SolarOpsError("ledger_error", err.message);
+    }
+    if (err.code === "illegal_transition" || err.code === "invalid_initial_status") {
+      throw new SolarOpsError("ledger_error", err.message);
+    }
+    if (err.code === "already_exists") {
+      throw new SolarOpsError("ledger_error", err.message);
+    }
+    throw new SolarOpsError("ledger_error", err.message);
+  }
+  throw err instanceof Error
+    ? new SolarOpsError("ledger_error", err.message)
+    : new SolarOpsError("ledger_error", String(err));
+}
+
+function assertNoIllegalProposeFields(input: Record<string, unknown>): void {
+  for (const field of ILLEGAL_PROPOSE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(input, field) && input[field] !== undefined) {
+      throw new SolarOpsError(
+        "illegal_field",
+        `Action payload must not carry '${field}' (service-owned field)`,
+      );
+    }
+  }
+}
+
+/** Coverage → confidence for candidate rows (never pure low while projection exists). */
+function confidenceFromCoverage(observedDays: number, daysInPeriod: number): Confidence {
+  if (observedDays < 2) return "low";
+  const ratio = daysInPeriod > 0 ? observedDays / daysInPeriod : 0;
+  if (ratio < 0.5) return "medium";
+  return "high";
 }
 
 function ymdCompact(isoDate: string): string {
@@ -233,6 +342,14 @@ export function createSolarOpsService(
     options.liveWeatherFetcher === undefined
       ? null
       : options.liveWeatherFetcher;
+
+  // Ledger is optional at construction; action verbs resolve lazily so pure
+  // engine callers never touch getLedger / the demo singleton.
+  let ledgerRef: ActionLedger | null = options.ledger ?? null;
+  function ledger(): ActionLedger {
+    if (!ledgerRef) ledgerRef = getLedger();
+    return ledgerRef;
+  }
 
   /** Latest ISO date (YYYY-MM-DD) present in fixture observations; demo default asOfDate. */
   function latestFixtureDate(): string {
@@ -853,6 +970,290 @@ export function createSolarOpsService(
     };
   }
 
+  // -------------------------------------------------------------------------
+  // KREDIT action verbs (C1) — thin ActionLedger wrappers. Tool/agent code
+  // must call these; never hold a raw ledger handle.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Create a proposed action. Rejects any payload carrying decidedBy /
+   * decidedAt / verification / status (illegal_field). On already_exists,
+   * reallocates id via nextSeq and retries (C4) — never upserts.
+   */
+  async function proposeAction(input: ProposeActionInput): Promise<ActionCommitment> {
+    assertNoIllegalProposeFields(input as unknown as Record<string, unknown>);
+    const led = ledger();
+    // Prefer date embedded in a well-formed id; else deadline; used only for retry seq.
+    const idDateKey = (() => {
+      if (input.id) {
+        const m = input.id.match(/^act_.+_(\d{8})_\d+$/);
+        if (m) {
+          const d = m[1]!;
+          return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
+        }
+      }
+      return input.deadline.slice(0, 10);
+    })();
+    const createdAt = input.createdAt ?? `${idDateKey}T08:00:00${LOCAL_OFFSET}`;
+    const maxRetries = assumptions.kredit.proposeMaxRetries;
+
+    let preferredId = input.id;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      let id = preferredId;
+      if (!id || attempt > 0) {
+        const seqHint = await led.nextSeq(input.siteId, idDateKey);
+        id = actionId(input.siteId, idDateKey, seqHint);
+      }
+      const row: ActionCommitment = {
+        id,
+        siteId: input.siteId,
+        sweepId: input.sweepId,
+        kind: input.kind,
+        title: input.title,
+        description: input.description,
+        rmImpact: input.rmImpact,
+        kwhImpact: input.kwhImpact,
+        confidence: input.confidence,
+        evidenceRefs: [...input.evidenceRefs],
+        deadline: input.deadline,
+        approvalClass: input.approvalClass,
+        status: "proposed",
+        policyDecisions: (input.policyDecisions ?? []).map((p) => ({ ...p })),
+        verification: null,
+        createdAt,
+        decidedAt: null,
+        decidedBy: null,
+      };
+      try {
+        await led.saveAction(row);
+        const saved = await led.getAction(id);
+        if (!saved) {
+          throw new SolarOpsError("ledger_error", `saveAction succeeded but getAction('${id}') is null`);
+        }
+        return saved;
+      } catch (err) {
+        if (err instanceof LedgerError && err.code === "already_exists") {
+          preferredId = undefined; // force fresh nextSeq on next attempt
+          continue;
+        }
+        mapLedgerError(err);
+      }
+    }
+    throw new SolarOpsError(
+      "ledger_error",
+      `proposeAction exhausted ${maxRetries} retries for site '${input.siteId}' deadline '${dateKey}' (already_exists)`,
+    );
+  }
+
+  /** proposed → awaiting_approval (optionally attach policy decisions). */
+  async function requestApproval(
+    id: string,
+    meta?: { policyDecisions?: PolicyDecision[] },
+  ): Promise<ActionCommitment> {
+    try {
+      const tmeta: TransitionMeta = {};
+      if (meta?.policyDecisions !== undefined) tmeta.policyDecisions = meta.policyDecisions;
+      return await ledger().transitionAction(id, "awaiting_approval", tmeta);
+    } catch (err) {
+      mapLedgerError(err);
+    }
+  }
+
+  /** proposed → denied_by_policy with governor decisions (offline/live deny path). */
+  async function denyByPolicy(
+    id: string,
+    meta: { policyDecisions: PolicyDecision[]; decidedAt?: string },
+  ): Promise<ActionCommitment> {
+    try {
+      return await ledger().transitionAction(id, "denied_by_policy", {
+        policyDecisions: meta.policyDecisions,
+        ...(meta.decidedAt !== undefined ? { decidedAt: meta.decidedAt } : {}),
+      });
+    } catch (err) {
+      mapLedgerError(err);
+    }
+  }
+
+  /**
+   * awaiting_approval → approved. decidedBy is REQUIRED here (C2: never a
+   * model-authored tool argument — only UI/API or governor auto path).
+   */
+  async function approveAction(
+    id: string,
+    opts: { decidedBy: string; decidedAt?: string; policyDecisions?: PolicyDecision[] },
+  ): Promise<ActionCommitment> {
+    const signer = opts.decidedBy?.trim();
+    if (!signer) {
+      throw new SolarOpsError(
+        "illegal_field",
+        "approveAction requires non-blank decidedBy (human or system principal)",
+      );
+    }
+    try {
+      return await ledger().transitionAction(id, "approved", {
+        decidedBy: signer,
+        decidedAt: opts.decidedAt ?? new Date().toISOString(),
+        ...(opts.policyDecisions !== undefined
+          ? { policyDecisions: opts.policyDecisions }
+          : {}),
+      });
+    } catch (err) {
+      mapLedgerError(err);
+    }
+  }
+
+  /** approved → issued. Signature must already be on the row (set at approval). */
+  async function issueAction(id: string): Promise<ActionCommitment> {
+    try {
+      return await ledger().transitionAction(id, "issued");
+    } catch (err) {
+      mapLedgerError(err);
+    }
+  }
+
+  /** Permanent grade on an issued row. Re-grade → verification_already_set. */
+  async function verifyAction(
+    id: string,
+    verification: ActionVerification,
+  ): Promise<ActionCommitment> {
+    try {
+      return await ledger().setVerification(id, verification);
+    } catch (err) {
+      mapLedgerError(err);
+    }
+  }
+
+  /**
+   * Deterministic candidate generation from ATAP credit-clock + detection (C5).
+   * The model never invents candidates — only selects by id and authors narrative.
+   *
+   * Rules:
+   *  - eligible + value_leak.total_rm > threshold → load_shift
+   *  - eligible + forfeited_credit_rm > 0 + anomaly that day → reschedule_maintenance
+   *  - data_issue day OR (ineligible + anomalous) → escalate
+   */
+  async function proposeCreditActionsDeterministic(
+    siteId: string,
+    asOfDate?: string,
+    opts?: { sweepId?: string; now?: string },
+  ): Promise<ActionCandidate[]> {
+    const site = requireSite(siteId);
+    const day = resolveAsOfDate(asOfDate);
+    const clock = atapCreditClock(siteId, day, opts?.now);
+    const detect = detectAssetUnderperformance(siteId, undefined, undefined, day);
+    const sweepId = opts?.sweepId ?? `swp_pending_${day.replace(/-/g, "")}`;
+    const conf = confidenceFromCoverage(
+      clock.coverage.observed_days,
+      clock.coverage.days_in_period,
+    );
+    const runRef = clock.source_manifest.runId;
+    const anomalyRef = detect.anomaly_event_id;
+    const deadline = clock.coverage.period_end;
+    const led = ledger();
+    const out: ActionCandidate[] = [];
+
+    // Ids key on asOfDate (sweep day), not deadline — deadline may be period end.
+    // nextSeq is advisory and does not advance until saveAction; allocate a
+    // contiguous local range so multi-candidate proposals never collide.
+    let seqCursor = await led.nextSeq(siteId, day);
+    const nextId = (): string => {
+      const id = actionId(siteId, day, seqCursor);
+      seqCursor += 1;
+      return id;
+    };
+
+    const eligible = clock.eligibility.eligible;
+    const totalLeak = clock.value_leak?.total_rm ?? 0;
+    const threshold = assumptions.kredit.valueLeakThresholdRm;
+    const isAnomalyDay =
+      detect.severity === "watch" ||
+      detect.severity === "anomaly" ||
+      detect.severity === "critical";
+    const isDataIssue = detect.severity === "data_issue";
+
+    if (eligible && clock.value_leak && clock.projection && totalLeak > threshold) {
+      const kwh = clock.projection.load_shiftable_export_kwh;
+      const rm = clock.value_leak.smp_spread_rm;
+      // stack−SMP unit savings implied by the DTO (honest: rm / kwh when kwh > 0).
+      const unit = kwh > 0 ? round(rm / kwh, 4) : null;
+      const unitNote =
+        unit != null
+          ? `${kwh} kWh × RM ${unit}/kWh (stack−SMP)`
+          : `${kwh} kWh load-shiftable export`;
+      out.push({
+        id: nextId(),
+        siteId,
+        sweepId,
+        kind: "load_shift",
+        title: `Load-shift to recover ATAP SMP-spread — ${site.name}`,
+        description:
+          `Shift on-site load into the export window to absorb ${kwh} kWh of ` +
+          `projected load-shiftable export by billing period end ${deadline}. ` +
+          `Estimated recovery ${unitNote} = RM ${rm} (value_leak.smp_spread_rm). ` +
+          `Total value leak RM ${totalLeak}. Evidence: ${runRef}.`,
+        rmImpact: rm,
+        kwhImpact: kwh,
+        confidence: conf,
+        evidenceRefs: [runRef, anomalyRef],
+        deadline,
+        approvalClass: "human_signature",
+      });
+    }
+
+    if (
+      eligible &&
+      clock.value_leak &&
+      clock.value_leak.forfeited_credit_rm > 0 &&
+      isAnomalyDay
+    ) {
+      const forfRm = clock.value_leak.forfeited_credit_rm;
+      const forfKwh = clock.projection?.forfeited_export_kwh ?? null;
+      out.push({
+        id: nextId(),
+        siteId,
+        sweepId,
+        kind: "reschedule_maintenance",
+        title: `Reschedule maintenance to cut forfeited credit — ${site.name}`,
+        description:
+          `Reschedule maintenance that may be driving forfeited export credit of ` +
+          `RM ${forfRm}` +
+          (forfKwh != null ? ` (${forfKwh} kWh forfeited export × Average SMP)` : "") +
+          ` by period end ${deadline}. Evidence: ${runRef}, ${anomalyRef}.`,
+        rmImpact: forfRm,
+        kwhImpact: forfKwh,
+        confidence: conf,
+        evidenceRefs: [runRef, anomalyRef],
+        deadline,
+        approvalClass: "human_signature",
+      });
+    }
+
+    if (isDataIssue || (!eligible && isAnomalyDay)) {
+      const reason = isDataIssue
+        ? `severity=data_issue on ${day}`
+        : `ATAP-ineligible (${clock.eligibility.reason ?? "cap"}) with severity=${detect.severity}`;
+      out.push({
+        id: nextId(),
+        siteId,
+        sweepId,
+        kind: "escalate",
+        title: `Escalate ${site.name} — ${isDataIssue ? "data quality" : "ineligible anomaly"}`,
+        description:
+          `Escalate site ${siteId} for operator review: ${reason}. ` +
+          `Anomaly ${anomalyRef}. Credit-clock run ${runRef}.`,
+        rmImpact: null,
+        kwhImpact: null,
+        confidence: conf === "low" ? "medium" : conf, // escalate stays actionable
+        evidenceRefs: [runRef, anomalyRef],
+        deadline: day, // escalate is for today, not period-end credit recovery
+        approvalClass: "auto",
+      });
+    }
+
+    return out;
+  }
+
   /**
    * Opt-in weather resolution with optional live Open-Meteo overlay.
    *
@@ -910,12 +1311,22 @@ export function createSolarOpsService(
     generateSolarReport,
     generateGreenPerformanceReport,
     atapCreditClock,
+    // KREDIT action surface (C1 / C4 / C5)
+    proposeAction,
+    requestApproval,
+    denyByPolicy,
+    approveAction,
+    issueAction,
+    verifyAction,
+    proposeCreditActionsDeterministic,
     /** Opt-in live+fixture weather merge (async; off the default hot path). */
     getWeatherMerged,
     /** Pure merge helper — fixture wins; live fills gaps. No I/O. */
     mergeLiveWeather: mergeWeatherPreferFixture,
     /** Exposed for tests: resolves default asOfDate from fixture observations. */
     latestFixtureDate,
+    /** Exposed for tests / sweep: the ledger handle this service wraps (do not use from tools). */
+    getLedger: ledger,
   };
 }
 
