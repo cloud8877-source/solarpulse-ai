@@ -4,8 +4,9 @@
 // (PDR-005 §6). No LLM is involved in any calculation here (ADR-0005).
 
 import { assumptions, MODEL_VERSION } from "../config/assumptions";
-import { buildSourceManifest, FIXTURE_INPUTS } from "../data/sourceManifest";
+import { buildSourceManifest, FIXTURE_INPUTS, STANDARD_ASSUMPTIONS } from "../data/sourceManifest";
 import { getStore, type SolarStore } from "../data/store";
+import { billingPeriodBounds, computeAtapCreditClock } from "../engine/atap";
 import { detectUnderperformance } from "../engine/anomaly";
 import { expectedProfile, fixtureWape, forecastSolarYield } from "../engine/forecast";
 import { generateGreenReport } from "../engine/greenReport";
@@ -32,7 +33,8 @@ export type SolarOpsErrorCode =
   | "site_not_found"
   | "anomaly_not_found"
   | "no_observations"
-  | "grid_unavailable";
+  | "grid_unavailable"
+  | "smp_unavailable";
 
 export class SolarOpsError extends Error {
   constructor(
@@ -494,6 +496,109 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     return { rows, kpi };
   }
 
+  /**
+   * ATAP credit-clock for a site (KREDIT / I2).
+   * Billing period = calendar month of asOfDate; Average SMP = PRECEDING month entry.
+   * Pure engine math + SourceManifest provenance; no HTTP route in this increment.
+   */
+  function atapCreditClock(siteId: string, asOfDate?: string) {
+    const site = requireSite(siteId);
+    const day = resolveAsOfDate(asOfDate);
+    const { periodStart, periodEnd } = billingPeriodBounds(day);
+
+    // Preceding calendar month of asOfDate (gazette §2 Average SMP definition).
+    const y = Number(day.slice(0, 4));
+    const m = Number(day.slice(5, 7));
+    const prevMonth = m === 1 ? 12 : m - 1;
+    const prevYear = m === 1 ? y - 1 : y;
+    const smpMonthLabel = `${prevYear}-${String(prevMonth).padStart(2, "0")}`;
+    const smpEntry = assumptions.atap.averageSmpByMonth[smpMonthLabel as keyof typeof assumptions.atap.averageSmpByMonth];
+    if (!smpEntry) {
+      throw new SolarOpsError(
+        "smp_unavailable",
+        `No Average SMP entry for preceding month '${smpMonthLabel}' (asOfDate ${day}). ` +
+          `Add assumptions.atap.averageSmpByMonth['${smpMonthLabel}'] before computing ATAP credits.`,
+      );
+    }
+
+    // Billing-period observations observed so far (date ≤ asOfDate, within the month).
+    const observations = store
+      .getObservations(siteId)
+      .filter((o) => {
+        const d = dateKey(o.timestamp);
+        return d >= periodStart && d <= day && d <= periodEnd;
+      });
+
+    const tariff =
+      site.tariffAssumptionRmPerKwh ?? assumptions.retailTariffRmPerKwh;
+
+    const result = computeAtapCreditClock({
+      site: {
+        id: site.id,
+        capacityKwp: site.capacityKwp,
+        tariffRmPerKwh: tariff,
+      },
+      observations,
+      asOfDate: day,
+      averageSmp: {
+        rmPerKwh: smpEntry.rmPerKwh,
+        monthLabel: smpMonthLabel,
+        provenance: smpEntry.provenance,
+        source: smpEntry.source,
+      },
+      assumptions,
+    });
+
+    const runId = `atap_${siteId}_${day.replace(/-/g, "")}`;
+    const manifest = buildSourceManifest({
+      runId,
+      inputs: [
+        FIXTURE_INPUTS.solar_sites!,
+        FIXTURE_INPUTS.solar_observations!,
+        {
+          name: "average_smp",
+          sourceType: smpEntry.provenance,
+          sourceName: `Average SMP ${smpMonthLabel}`,
+          url: smpEntry.source.startsWith("http") ? smpEntry.source.split(" ")[0] : undefined,
+          isFixture: false,
+        },
+        {
+          name: "retail_tariff_rm_per_kwh",
+          sourceType: "public",
+          sourceName: "TNB gazetted energy charge (site override or Non-Domestic LV General)",
+          url: "https://www.mytnb.com.my/tariff",
+          isFixture: false,
+        },
+        {
+          name: "grid_emission_factor",
+          sourceType: "public",
+          sourceName: "Peninsular Malaysia GEF projection 2026 (JPPET 2/2025)",
+          url: "https://singlebuyer.com.my/docs/default-source/about/gef-projection-publication_31122025v1.pdf",
+          isFixture: false,
+        },
+      ],
+      assumptions: [
+        ...STANDARD_ASSUMPTIONS,
+        {
+          name: "atap_average_smp_rm_per_kwh",
+          value: smpEntry.rmPerKwh,
+          note: `Preceding month ${smpMonthLabel}; provenance=${smpEntry.provenance}`,
+        },
+        {
+          name: "atap_sun_hours_per_day",
+          value: assumptions.atap.sunHoursPerDay,
+          note: "Gazette GP/ST/No.60/2025 section 2 MAQ definition",
+        },
+      ],
+    });
+
+    return {
+      site_id: siteId,
+      ...result,
+      source_manifest: manifest,
+    };
+  }
+
   // Everything the Site Detail screen needs, including the hourly observed-vs-expected
   // series for the forecast chart (scoped to asOfDate).
   function siteDetail(siteId: string, asOfDate?: string) {
@@ -535,6 +640,7 @@ export function createSolarOpsService(store: SolarStore = getStore()) {
     rankOmActions,
     generateSolarReport,
     generateGreenPerformanceReport,
+    atapCreditClock,
     /** Exposed for tests: resolves default asOfDate from fixture observations. */
     latestFixtureDate,
   };
