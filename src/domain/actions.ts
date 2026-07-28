@@ -25,6 +25,11 @@ export interface ActionVerification {
   measuredRm: number | null;
   note: string;
   verifiedAt: string;
+  /**
+   * Grade-band + coverage caveats (config/engine derived; never model-authored).
+   * Optional for seed rows written before I6.
+   */
+  assumptions?: string[];
 }
 
 export interface ActionCommitment {

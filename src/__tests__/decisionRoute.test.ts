@@ -139,4 +139,35 @@ describe("POST /api/agent/actions/[id]/decision", () => {
     expect(json.error).toBe("ledger_error");
     expect(json.message.toLowerCase()).toContain("illegal transition");
   });
+
+  it("I7-1: stranded approved (approve via service, then route approve) → issued", async () => {
+    // Simulate the mid-flight failure: approveAction succeeds, issueAction never ran.
+    const id = await seedAwaitingLoadShift();
+    const ledger = getLedger();
+    const svc = createSolarOpsService(undefined, { ledger });
+    await svc.approveAction(id, {
+      decidedBy: "stranded_operator",
+      decidedAt: NOW,
+    });
+    const mid = await ledger.getAction(id);
+    expect(mid?.status).toBe("approved");
+    expect(mid?.decidedBy).toBe("stranded_operator");
+
+    // Route must skip re-approve and issue from the stranded state.
+    const res = await callDecision(id, {
+      decision: "approve",
+      decided_by: "retry_operator",
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      action: { status: string; decidedBy: string | null };
+    };
+    expect(json.action.status).toBe("issued");
+    // Signature stays the original approver (issue does not rewrite decidedBy).
+    expect(json.action.decidedBy).toBe("stranded_operator");
+
+    const row = await ledger.getAction(id);
+    expect(row?.status).toBe("issued");
+    expect(row?.decidedBy).toBe("stranded_operator");
+  });
 });

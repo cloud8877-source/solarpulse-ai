@@ -10,9 +10,8 @@ import {
  * Fail-closed: any fetch/merge miss → "fixture conditions" (never an error UI).
  */
 export async function WeatherBadge({ siteId = "site_a" }: { siteId?: string }) {
-  // Wall-clock "now" in MYT for the badge label (display provenance only).
+  // Wall-clock "now" in MYT — used only to request today's merge, NOT the badge label.
   const now = new Date();
-  // Format HH:MM MYT without relying on ICU timezone data quirks.
   const mytMs = now.getTime() + 8 * 60 * 60 * 1000;
   const myt = new Date(mytMs);
   const hh = String(myt.getUTCHours()).padStart(2, "0");
@@ -26,6 +25,8 @@ export async function WeatherBadge({ siteId = "site_a" }: { siteId?: string }) {
   let live = false;
   let ghi: number | null = null;
   let cloudPct: number | null = null;
+  /** HH:MM from the picked observation row (I7-4 — not render-time). */
+  let asOfHhMm: string | null = null;
 
   try {
     const svc = createSolarOpsService(undefined, {
@@ -50,6 +51,8 @@ export async function WeatherBadge({ siteId = "site_a" }: { siteId?: string }) {
         pick.cloudCover != null && Number.isFinite(pick.cloudCover)
           ? Math.round(pick.cloudCover * 100)
           : null;
+      // I7-4: label the row's own timestamp, not wall-clock retrieval time.
+      asOfHhMm = pick.timestamp.slice(11, 16);
     }
   } catch {
     live = false;
@@ -65,13 +68,14 @@ export async function WeatherBadge({ siteId = "site_a" }: { siteId?: string }) {
 
   const ghiLabel = ghi != null ? `${Math.round(ghi)} W/m²` : "— W/m²";
   const cloudLabel = cloudPct != null ? `${cloudPct}% cloud` : "— cloud";
+  const asOfLabel = asOfHhMm ?? `${hh}:${mm}`;
 
   return (
     <span
       className="badge weather-badge weather-live"
       title={`Live weather for ${siteId} (display-only; not wired into engine)`}
     >
-      LIVE · Open-Meteo · retrieved {hh}:{mm} MYT · GHI {ghiLabel} · {cloudLabel}
+      LIVE · Open-Meteo · as of {asOfLabel} MYT · GHI {ghiLabel} · {cloudLabel}
     </span>
   );
 }

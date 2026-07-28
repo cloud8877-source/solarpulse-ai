@@ -9,6 +9,9 @@ export const runtime = "nodejs";
  * Body: { decision: 'approve' | 'deny', decided_by: string, reason?: string }
  *
  * approve → approveAction (decidedBy) THEN issueAction (demo tap: amber→green).
+ *   Idempotent retry (I7-1): if the row is already 'approved' (stranded after a
+ *   partial prior attempt), skip approveAction and go straight to issueAction so
+ *   there is always a legal exit to issued.
  * deny    → denyAction (human_rejected policyDecision; decidedBy required).
  */
 export async function POST(
@@ -54,7 +57,14 @@ export async function POST(
     const now = new Date().toISOString();
 
     if (decision === "approve") {
-      await svc.approveAction(id, { decidedBy, decidedAt: now });
+      // I7-1: read current status first. Stranded approved → issue only.
+      const current = await ledger.getAction(id);
+      if (!current) {
+        throw new SolarOpsError("action_not_found", `Unknown action '${id}'`);
+      }
+      if (current.status !== "approved") {
+        await svc.approveAction(id, { decidedBy, decidedAt: now });
+      }
       const issued = await svc.issueAction(id);
       return Response.json({ action: issued });
     }

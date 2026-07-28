@@ -8,17 +8,22 @@ import type {
   ActionStatus,
   SweepRun,
 } from "@/domain/actions";
-import { fmtInt } from "@/app/components/ui";
+import { fmtInt, fmtRm } from "@/app/components/ui";
+import type { KreditScoreboard } from "@/services/solarops";
 
 const OPERATOR_KEY = "solarpulse.kredit.operatorName";
+/** Fixture June 2026 closed period — default for the demo verify picker. */
+const DEFAULT_VERIFY_PERIOD_END = "2026-06-30";
 
 type FeedProps = {
   sweeps: SweepRun[];
   actionsBySweep: Record<string, ActionCommitment[]>;
+  scoreboard: KreditScoreboard;
 };
 
-function isSeedTitle(title: string): boolean {
-  return title.startsWith("[SEED]");
+/** I7-6: SEED badge keys on data (evidenceRefs), not title prefix. */
+function isSeedAction(row: ActionCommitment): boolean {
+  return row.evidenceRefs.includes("seed_fixture");
 }
 
 /** Status chip from row.status + optional verification outcome. */
@@ -132,7 +137,7 @@ function ActionRow({
   onDecided: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const seed = isSeedTitle(row.title);
+  const seed = isSeedAction(row);
 
   return (
     <div className={`action-row ${open ? "open" : ""}`}>
@@ -363,11 +368,13 @@ function SweepCard({
   );
 }
 
-export function OpsFeed({ sweeps, actionsBySweep }: FeedProps) {
+export function OpsFeed({ sweeps, actionsBySweep, scoreboard }: FeedProps) {
   const router = useRouter();
   const [operatorName, setOperatorName] = useState("");
   const [running, setRunning] = useState(false);
+  const [verifying, setVerifying] = useState(false);
   const [runMsg, setRunMsg] = useState<string | null>(null);
+  const [periodEnd, setPeriodEnd] = useState(DEFAULT_VERIFY_PERIOD_END);
 
   useEffect(() => {
     try {
@@ -418,6 +425,38 @@ export function OpsFeed({ sweeps, actionsBySweep }: FeedProps) {
     setRunning(false);
   }
 
+  async function runVerify() {
+    setVerifying(true);
+    setRunMsg(null);
+    try {
+      const r = await fetch("/api/agent/verify", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ period_end: periodEnd }),
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        setRunMsg(data.message ?? data.error ?? `HTTP ${r.status}`);
+      } else {
+        setRunMsg(
+          `Verify ${data.period_end}: ${data.graded ?? 0} graded · ${data.expired ?? 0} expired · ${data.skipped ?? 0} skipped` +
+            (data.issued_then_graded
+              ? ` · ${data.issued_then_graded} stranded-issued`
+              : ""),
+        );
+        router.refresh();
+      }
+    } catch (e) {
+      setRunMsg((e as Error).message);
+    }
+    setVerifying(false);
+  }
+
+  const accuracyLabel =
+    scoreboard.action_accuracy != null
+      ? `${(scoreboard.action_accuracy * 100).toFixed(0)}% (${scoreboard.verified_count}/${scoreboard.graded_count})`
+      : "—";
+
   return (
     <div>
       <div className="section-title">
@@ -428,9 +467,56 @@ export function OpsFeed({ sweeps, actionsBySweep }: FeedProps) {
             reschedule · SEED rows are labeled fixtures
           </p>
         </div>
-        <button className="btn" onClick={runSweep} disabled={running}>
-          {running ? "Running…" : "Run sweep"}
-        </button>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+          <label className="muted" style={{ fontSize: "0.82rem", display: "flex", gap: 6, alignItems: "center" }}>
+            Period end
+            <input
+              type="date"
+              value={periodEnd}
+              onChange={(e) => setPeriodEnd(e.target.value)}
+              disabled={verifying || running}
+              aria-label="Verification period end"
+              style={{
+                background: "var(--surface-2)",
+                border: "1px solid var(--border)",
+                borderRadius: 6,
+                color: "inherit",
+                padding: "4px 8px",
+              }}
+            />
+          </label>
+          <button className="btn secondary" onClick={runVerify} disabled={verifying || running}>
+            {verifying ? "Verifying…" : "Run verification"}
+          </button>
+          <button className="btn" onClick={runSweep} disabled={running || verifying}>
+            {running ? "Running…" : "Run sweep"}
+          </button>
+        </div>
+      </div>
+
+      {/* Lifetime scoreboard — server-derived, engine numbers only (I6 / B6). */}
+      <div className="grid kpi-grid" style={{ marginBottom: 16 }}>
+        <div className="kpi">
+          <span className="label">RM identified</span>
+          <span className="value" style={{ fontSize: "1.2rem" }}>
+            RM {fmtRm(scoreboard.rm_identified)}
+          </span>
+          <span className="sub">issued + graded · sum rmImpact</span>
+        </div>
+        <div className="kpi">
+          <span className="label">RM verified</span>
+          <span className="value green" style={{ fontSize: "1.2rem" }}>
+            RM {fmtRm(scoreboard.rm_verified)}
+          </span>
+          <span className="sub">verified + partial · sum measuredRm</span>
+        </div>
+        <div className="kpi">
+          <span className="label">Action accuracy</span>
+          <span className="value" style={{ fontSize: "1.2rem" }}>
+            {accuracyLabel}
+          </span>
+          <span className="sub">verified / graded</span>
+        </div>
       </div>
 
       {runMsg ? (

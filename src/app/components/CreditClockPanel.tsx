@@ -9,7 +9,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { fmtInt } from "@/app/components/ui";
+import { fmtInt, fmtRm } from "@/app/components/ui";
 
 /** Snake_case ATAP DTO slice used by the credit-clock panel (service return type). */
 export type CreditClockDto = {
@@ -63,30 +63,34 @@ function dayLabel(isoDate: string, offset: number): string {
   return d.toISOString().slice(5, 10); // MM-DD
 }
 
-/** Compact burn-down: projected credit accrual vs offsettable ceiling. */
+/**
+ * Compact burn-down: projected credit accrual vs full-period credit at MAQ.
+ * Accrual line is a CLIENT-SIDE linear projection of the engine's
+ * linear_daily_mean end-of-period credit_rm (not a separate engine series).
+ */
 function buildBurnDown(clock: CreditClockDto) {
   const days = Math.max(1, clock.coverage.days_in_period);
   const observed = Math.min(clock.coverage.observed_days, days);
   const creditEnd = clock.projection?.credit_rm ?? 0;
-  // Offsettable ceiling = full-period credit on offsettable export (engine credit_rm).
-  const ceiling = creditEnd;
+  // Full-period credit at MAQ = engine credit_rm (offsettable export × Average SMP).
+  const fullPeriodCredit = creditEnd;
   const points: Array<{
     day: string;
     dayIndex: number;
     accrual: number;
-    ceiling: number;
+    fullPeriodCredit: number;
   }> = [];
   for (let i = 1; i <= days; i++) {
     points.push({
       day: dayLabel(clock.coverage.period_start, i - 1),
       dayIndex: i,
-      // Linear projected accrual across the billing period.
+      // Linear projected accrual across the billing period (client-side only).
       accrual: Math.round((creditEnd * i) / days * 100) / 100,
-      ceiling,
+      fullPeriodCredit,
     });
   }
   const todayIndex = Math.max(1, Math.min(observed, days));
-  return { points, todayIndex, ceiling, creditEnd };
+  return { points, todayIndex, fullPeriodCredit, creditEnd };
 }
 
 export function CreditClockPanel({ clock }: { clock: CreditClockDto }) {
@@ -104,7 +108,7 @@ export function CreditClockPanel({ clock }: { clock: CreditClockDto }) {
     );
   }
 
-  const { points, todayIndex, ceiling } = buildBurnDown(clock);
+  const { points, todayIndex, fullPeriodCredit } = buildBurnDown(clock);
   const todayLabel = points[todayIndex - 1]?.day;
   const leak = clock.value_leak;
   const proj = clock.projection;
@@ -178,19 +182,19 @@ export function CreditClockPanel({ clock }: { clock: CreditClockDto }) {
             <div className="kpi">
               <span className="label">SMP spread</span>
               <span className="value amber" style={{ fontSize: "1.15rem" }}>
-                RM {fmtInt(leak.smp_spread_rm)}
+                RM {fmtRm(leak.smp_spread_rm)}
               </span>
             </div>
             <div className="kpi">
               <span className="label">Forfeited credit</span>
               <span className="value red" style={{ fontSize: "1.15rem" }}>
-                RM {fmtInt(leak.forfeited_credit_rm)}
+                RM {fmtRm(leak.forfeited_credit_rm)}
               </span>
             </div>
             <div className="kpi">
               <span className="label">Total (engine)</span>
               <span className="value red" style={{ fontSize: "1.15rem" }}>
-                RM {fmtInt(leak.total_rm)}
+                RM {fmtRm(leak.total_rm)}
               </span>
             </div>
           </div>
@@ -198,7 +202,7 @@ export function CreditClockPanel({ clock }: { clock: CreditClockDto }) {
             Components independently rounded; total computed before rounding
           </p>
 
-          {/* N6: ceiling ONLY with its full label — never bare. */}
+          {/* N6: ceiling ONLY with its full label — never bare. Distinct from chart series. */}
           <div
             className="card tight"
             style={{ marginTop: 12, background: "var(--surface-2)" }}
@@ -208,7 +212,7 @@ export function CreditClockPanel({ clock }: { clock: CreditClockDto }) {
               achievable by scheduling alone
             </span>
             <span className="value muted" style={{ fontSize: "1.05rem" }}>
-              RM {fmtInt(leak.smp_spread_ceiling_rm)}
+              RM {fmtRm(leak.smp_spread_ceiling_rm)}
             </span>
           </div>
         </div>
@@ -216,11 +220,15 @@ export function CreditClockPanel({ clock }: { clock: CreditClockDto }) {
 
       <div style={{ marginTop: 16 }}>
         <div className="section-title">
-          <h3 style={{ margin: 0 }}>Credit accrual vs offsettable ceiling</h3>
+          <h3 style={{ margin: 0 }}>Credit accrual vs full-period credit at MAQ</h3>
           <span className="muted" style={{ fontSize: "0.78rem" }}>
-            ceiling RM {fmtInt(ceiling)}
+            full-period RM {fmtRm(fullPeriodCredit)}
           </span>
         </div>
+        <p className="muted" style={{ fontSize: "0.78rem", margin: "0 0 8px" }}>
+          Accrual line is a linear projection (derived client-side from the engine&apos;s
+          linear_daily_mean end-of-period credit).
+        </p>
         <ResponsiveContainer width="100%" height={240}>
           <ComposedChart data={points} margin={{ top: 8, right: 12, bottom: 0, left: -6 }}>
             <XAxis dataKey="day" stroke="#6b7798" tick={{ fontSize: 11 }} interval="preserveStartEnd" />
@@ -233,17 +241,17 @@ export function CreditClockPanel({ clock }: { clock: CreditClockDto }) {
                 color: "#e9eefb",
               }}
               formatter={(v: unknown, name) => [
-                typeof v === "number" ? `RM ${Math.round(v)}` : "—",
+                typeof v === "number" ? `RM ${fmtRm(v)}` : "—",
                 name,
               ]}
             />
             <Line
-              dataKey="ceiling"
+              dataKey="fullPeriodCredit"
               stroke="#6b7798"
               strokeWidth={1.5}
               strokeDasharray="4 4"
               dot={false}
-              name="Offsettable ceiling"
+              name="Full-period credit at MAQ"
             />
             <Line
               dataKey="accrual"

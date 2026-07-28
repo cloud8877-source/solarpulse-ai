@@ -40,7 +40,15 @@ export class LedgerError extends Error {
 // Transition guard (single shared implementation — BOTH backends call this)
 // ---------------------------------------------------------------------------
 
-/** Legal edges only. Reaching issued requires approved; approved requires decidedBy. */
+/**
+ * Legal edges only. Reaching issued requires approved; approved requires decidedBy.
+ *
+ * proposed → expired is intentionally ILLEGAL. Every proposeAction caller
+ * (sweep offline path, commit_action / escalate tools) immediately follows with
+ * requestApproval or denyByPolicy — nothing can strand at proposed. Verified by
+ * grep of proposeAction call sites (I6 / B4). If a future path can leave a row
+ * at proposed, add proposed→expired here with a regression test.
+ */
 const LEGAL_TRANSITIONS: Readonly<Record<ActionStatus, readonly ActionStatus[]>> = {
   proposed: ["awaiting_approval", "denied_by_policy"],
   awaiting_approval: ["approved", "denied_by_policy", "expired"],
@@ -522,7 +530,14 @@ function cloneAction(a: ActionCommitment): ActionCommitment {
     ...a,
     evidenceRefs: [...a.evidenceRefs],
     policyDecisions: a.policyDecisions.map((p) => ({ ...p })),
-    verification: a.verification ? { ...a.verification } : null,
+    verification: a.verification
+      ? {
+          ...a.verification,
+          ...(a.verification.assumptions
+            ? { assumptions: [...a.verification.assumptions] }
+            : {}),
+        }
+      : null,
   };
 }
 

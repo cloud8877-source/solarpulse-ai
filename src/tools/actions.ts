@@ -1,5 +1,9 @@
 // KREDIT write tools (I5). Exactly two write tools; NO decidedBy anywhere (C2).
 // Execute delegates to service verbs only — never holds a raw ledger.
+//
+// I6: No verify tool is exposed in this increment. If a future increment adds
+// one, its schema MUST exclude outcome / measuredRm — the model must never
+// author grades (grades are permanent, engine-derived only).
 
 import { tool } from "ai";
 import { z } from "zod";

@@ -178,4 +178,6 @@ export const solaropsTools = {
   explain_solar_anomaly: explainSolarAnomalyTool,
   rank_om_actions: rankOmActionsTool,
   generate_solar_report: generateSolarReportTool,
+  // I6: no verify tool — grades are permanent engine-derived; model cannot author
+  // outcome/measuredRm. If a future increment exposes one, schema must exclude those fields.
 };
